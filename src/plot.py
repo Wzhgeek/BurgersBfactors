@@ -2,11 +2,8 @@
 # <wangzh011031@163.com>
 """
 绘图模块：u-x 空间剖面图 & u-t 自轨迹图。
-
-依赖 code/step3_dyn/burgers.rk4_step 进行仿真。
 """
 
-import sys
 from pathlib import Path
 
 import matplotlib
@@ -14,11 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-
-# ── 固定项目根路径，确保能导入 code 包 ──
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+from .burgers import rk4_step
 
 
 def plot_ux(A: np.ndarray,
@@ -30,7 +23,8 @@ def plot_ux(A: np.ndarray,
             dt: float,
             dx: float,
             n_steps: int,
-            save_path) -> None:
+            save_path,
+            model: str | None = None) -> None:
     """
     绘制 u-x 空间剖面图：在 pulse_idx 处施加脉冲，于 5 个快照时刻
     展示空间分布。
@@ -61,8 +55,6 @@ def plot_ux(A: np.ndarray,
     save_path : str or Path
         图片保存路径。
     """
-    from code.step3_dyn.burgers import rk4_step
-
     N = A.shape[0]
     x_coord = np.linspace(0, 1, N, endpoint=False) + 0.5 / N
 
@@ -100,7 +92,8 @@ def plot_ux(A: np.ndarray,
     ax.set_yticks(np.arange(0, y_top + 0.1, 0.1))
 
     ax.set_title(rf"{pdb_id} L{level:02d}: "
-                 rf"$\nu={nu}$ $\varepsilon={eps}$")
+                 rf"$\nu={nu}$ $\varepsilon={eps}$"
+                 + (rf" Model={model}" if model else ""))
     ax.legend(fontsize=6)
     ax.grid(True, alpha=0.2)
     fig.patch.set_facecolor("white")
@@ -119,7 +112,8 @@ def plot_ut(trj: np.ndarray,
             level: int,
             dt: float,
             sample_every: int,
-            save_path) -> None:
+            save_path,
+            model: str | None = None) -> None:
     """
     绘制 u-t 自轨迹图：每行一个原子，着色按原子索引 (viridis)。
 
@@ -166,7 +160,8 @@ def plot_ut(trj: np.ndarray,
     ax.set_yticks(np.arange(0, y_top + 0.1, 0.1))
 
     ax.set_title(rf"{pdb_id} L{level:02d} u-t: "
-                 rf"$\nu={nu}$ $\varepsilon={eps}$")
+                 rf"$\nu={nu}$ $\varepsilon={eps}$"
+                 + (rf" Model={model}" if model else ""))
     ax.grid(True, alpha=0.2)
     fig.patch.set_facecolor("white")
     plt.tight_layout()

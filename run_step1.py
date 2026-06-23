@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from src.utils import load_yaml, setup_logging
+from src.utils import load_yaml, setup_logging, resolve_path
 from src.step1_distance import (
     compute_filtration_thresholds,
     pairwise_distance_matrix,
@@ -99,16 +99,20 @@ def main():
     cfg = load_yaml(args.config)
     project_root = Path(__file__).resolve().parent
     dataset = args.dataset
+    paths = cfg.get("paths", {})
+    result_root = resolve_path(project_root, paths.get("output_root", project_root / "result"))
+    pdb_root = resolve_path(project_root, paths.get("pdb_dir", project_root / "protein"))
+    xyz_root = resolve_path(project_root, paths.get("code_data", project_root / "code_data"))
     num_levels = cfg["graph"]["num_levels"]
     aij_k = cfg["graph"]["aij_k"]
     pct_start = cfg["graph"]["percentile_start"]
     pct_stop = cfg["graph"]["percentile_stop"]
 
-    output_dir = project_root / "result" / dataset
+    output_dir = result_root / dataset
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.from_pdb:
-        pdb_dir = project_root / "protein"
+        pdb_dir = pdb_root
         for pdb_file in sorted(pdb_dir.glob("*.pdb")):
             pdb_id = pdb_file.stem
             if args.protein and pdb_id.upper() != args.protein.upper():
@@ -119,7 +123,7 @@ def main():
                 continue
             process_protein(xyzb, pdb_id, output_dir, num_levels, aij_k, pct_start, pct_stop)
     else:
-        xyz_dir = args.data_dir or (project_root / "code_data" / dataset)
+        xyz_dir = args.data_dir or (xyz_root / dataset)
         if not xyz_dir.exists():
             print(f"ERROR: data dir not found: {xyz_dir}")
             return 1

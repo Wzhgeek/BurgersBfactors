@@ -1,5 +1,8 @@
 #!/bin/bash
+# Author: Zihan Wang
+# <wangzh011031@163.com>
 # Master submission: submits one job per protein across all datasets.
+# 推荐使用: bash slurm/pcode_job.sh submit-all [max_concurrent]
 # Usage: bash submit_all.sh [max_concurrent]
 
 MAX_JOBS=${1:-10}
@@ -41,9 +44,13 @@ for ds in "${DATASETS[@]}"; do
             sleep 30
         done
 
-        sbatch --job-name="${ds}_${protein}" \
+        sbatch --partition="${PCODE_PARTITION:-general-long}" \
+               --cpus-per-task="${PCODE_CPUS:-16}" \
+               --mem="${PCODE_MEM:-32G}" \
+               --time="${PCODE_TIME:-12:00:00}" \
+               --job-name="pcode_${ds}_${protein}" \
                --output="${LOGDIR}/${ds}_${protein}_%j.out" \
-               "${SCRIPT_DIR}/submit_protein.sh" "$ds" "$protein"
+               "${SCRIPT_DIR}/run_worker.sh" "$ds" "$protein"
 
         SUBMITTED=$((SUBMITTED + 1))
         echo "[$SUBMITTED/$TOTAL] ${ds}/${protein}"

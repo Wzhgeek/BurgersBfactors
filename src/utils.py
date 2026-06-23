@@ -1,7 +1,17 @@
+# Author: Zihan Wang
+# <wangzh011031@163.com>
 """日志、IO 工具。"""
 import logging
 import sys
 from pathlib import Path
+
+
+def resolve_path(project_root: Path, path_value: str | Path) -> Path:
+    """将配置中的路径解析为绝对路径（支持相对 project_root）。"""
+    p = Path(path_value)
+    if p.is_absolute():
+        return p
+    return (project_root / p).resolve()
 
 
 def setup_logging(log_path: Path, level=logging.INFO):

@@ -11,23 +11,60 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from src.utils import load_yaml, resolve_path
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Cross-protein result summary")
+    p.add_argument("--config", type=Path, default=Path(__file__).with_name("config.yaml"))
     p.add_argument("--dataset", type=str, default="33small")
     p.add_argument("--all", action="store_true", help="Process all datasets")
     p.add_argument("--output-dir", type=str, default=None,
-                   help="Override output dir (default: Pcode/result/<dataset>)")
+                   help="Override output dir (default: output_root/<dataset> from config)")
     return p.parse_args()
 
 
-def summarize_dataset(dataset: str, output_dir: Path = None):
-    project_root = Path(__file__).resolve().parent
-    result_base = project_root / "result" / dataset
+def _best_row(pdb: str, per_level: dict, runtime) -> dict:
+    """从 per_level_* 中按 OOF 选全局最优，同时输出三种 PCC。"""
+    best_lvl, best_eps, best_model = "", "", "RF"
+    best_oof, best_fold, best_fold_pcc, best_mean = -999, 1, -999, -999
+    for lvl_key, info in per_level.items():
+        if isinstance(info, dict):
+            oof = float(info.get("oof_pcc", info.get("pcc", 0)))
+            if oof > best_oof:
+                best_oof = oof
+                best_lvl = lvl_key
+                best_eps = info.get("eps", "")
+                best_model = info.get("model", "RF")
+                best_fold = int(info.get("best_fold", 1))
+                best_fold_pcc = float(info.get("best_fold_pcc", oof))
+                best_mean = float(info.get("mean_fold_pcc", oof))
+        elif isinstance(info, (int, float)):
+            if info > best_oof:
+                best_oof = info
+                best_lvl = lvl_key
+
+    return {
+        "Protein": pdb,
+        "Level": best_lvl,
+        "Epsilon": best_eps,
+        "OOF_PCC": round(best_oof, 4),
+        "BestFold": best_fold,
+        "BestFold_PCC": round(best_fold_pcc, 4) if best_fold_pcc != -999 else "",
+        "MeanFold_PCC": round(best_mean, 4) if best_mean != -999 else "",
+        "Runtime": runtime,
+        "Model": best_model,
+    }
+
+
+def summarize_dataset(dataset: str, result_root: Path, output_dir: Path = None):
+    result_base = result_root / dataset
 
     if output_dir is None:
         output_dir = result_base
@@ -49,47 +86,15 @@ def summarize_dataset(dataset: str, output_dir: Path = None):
 
         sim_time = data.get("simulation_time_s", 0)
 
-        # Best per-level stats — pick the single best
-        best_lvl, best_eps, best_pcc = "", "", -999
-        per_lvl_s = data.get("per_level_stats", {})
-        for lvl_key, info in per_lvl_s.items():
-            if isinstance(info, dict):
-                pcc = info.get("pcc", 0)
-                if pcc > best_pcc:
-                    best_pcc = pcc
-                    best_lvl = lvl_key
-                    best_eps = info.get("eps", "")
-            elif isinstance(info, (int, float)):
-                if info > best_pcc:
-                    best_pcc = info
-                    best_lvl = lvl_key
+        rows_stats.append(_best_row(
+            pdb, data.get("per_level_stats", {}),
+            data.get("rf_time_stats_s", sim_time),
+        ))
 
-        rows_stats.append({
-            "Protein": pdb, "BestLevel": best_lvl, "BestEpsilon": best_eps,
-            "BestPCC": round(best_pcc, 4),
-            "Runtime_s": data.get("rf_time_stats_s", sim_time),
-        })
-
-        # Best per-level trajectory — single best
-        best_lvl_t, best_eps_t, best_pcc_t = "", "", -999
-        per_lvl_t = data.get("per_level_trj", {})
-        for lvl_key, info in per_lvl_t.items():
-            if isinstance(info, dict):
-                pcc = info.get("pcc", 0)
-                if pcc > best_pcc_t:
-                    best_pcc_t = pcc
-                    best_lvl_t = lvl_key
-                    best_eps_t = info.get("eps", "")
-            elif isinstance(info, (int, float)):
-                if info > best_pcc_t:
-                    best_pcc_t = info
-                    best_lvl_t = lvl_key
-
-        rows_trj.append({
-            "Protein": pdb, "BestLevel": best_lvl_t, "BestEpsilon": best_eps_t,
-            "BestPCC": round(best_pcc_t, 4),
-            "Runtime_s": data.get("rf_time_trj_s", sim_time),
-        })
+        rows_trj.append(_best_row(
+            pdb, data.get("per_level_trj", {}),
+            data.get("rf_time_trj_s", sim_time),
+        ))
 
     # Write CSV for stats features
     if rows_stats:
@@ -110,30 +115,43 @@ def write_csv(path: Path, rows: list[dict]):
     keys = list(rows[0].keys())
     lines = [",".join(keys)]
 
-    # Compute averages for PCC
-    pcc_key = "BestPCC" if "BestPCC" in rows[0] else "PCC"
-    pcc_vals = [r[pcc_key] for r in rows if isinstance(r[pcc_key], (int, float))]
-    rt_vals = [r["Runtime_s"] for r in rows if isinstance(r["Runtime_s"], (int, float))]
-    avg_pcc = np.mean(pcc_vals) if pcc_vals else 0
+    oof_vals = [r["OOF_PCC"] for r in rows if isinstance(r.get("OOF_PCC"), (int, float))]
+    bf_vals = [r["BestFold_PCC"] for r in rows if isinstance(r.get("BestFold_PCC"), (int, float))]
+    mf_vals = [r["MeanFold_PCC"] for r in rows if isinstance(r.get("MeanFold_PCC"), (int, float))]
+    rt_vals = [r["Runtime"] for r in rows if isinstance(r.get("Runtime"), (int, float))]
+    avg_oof = np.mean(oof_vals) if oof_vals else 0
+    avg_bf = np.mean(bf_vals) if bf_vals else 0
+    avg_mf = np.mean(mf_vals) if mf_vals else 0
     avg_rt = np.mean(rt_vals) if rt_vals else 0
 
     for row in rows:
         lines.append(",".join(str(row[k]) for k in keys))
 
-    # Average row
-    avg_row = ["AVG"] + [""] * (len(keys) - 3) + [f"{avg_pcc:.4f}", f"{avg_rt:.1f}"]
-    lines.append(",".join(avg_row))
+    avg_row = {k: "" for k in keys}
+    avg_row["Protein"] = "AVG"
+    avg_row["OOF_PCC"] = f"{avg_oof:.4f}"
+    avg_row["BestFold_PCC"] = f"{avg_bf:.4f}"
+    avg_row["MeanFold_PCC"] = f"{avg_mf:.4f}"
+    avg_row["Runtime"] = f"{avg_rt:.1f}"
+    lines.append(",".join(str(avg_row[k]) for k in keys))
 
     path.write_text("\n".join(lines) + "\n")
 
 
 def main():
     args = parse_args()
+    project_root = Path(__file__).resolve().parent
+    cfg = load_yaml(args.config)
+    paths = cfg.get("paths", {})
+    result_root = resolve_path(project_root, paths.get("output_root", project_root / "result"))
+    out_override = Path(args.output_dir) if args.output_dir else None
+    datasets = cfg.get("datasets", ["33small", "35large", "36med"])
+
     if args.all:
-        for ds in ["33small", "35large", "36med"]:
-            summarize_dataset(ds, args.output_dir)
+        for ds in datasets:
+            summarize_dataset(ds, result_root, out_override)
     else:
-        summarize_dataset(args.dataset, args.output_dir)
+        summarize_dataset(args.dataset, result_root, out_override)
 
 
 if __name__ == "__main__":

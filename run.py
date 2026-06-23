@@ -25,7 +25,7 @@ from src.burgers import rk4_step
 from src.features import extract_stats_features, simulate_trajectories, load_aij_matrices
 from src.regression import evaluate_regressor
 from src.plot import plot_ux, plot_ut
-from src.utils import load_yaml, save_json, setup_logging, pcc_10digit
+from src.utils import load_yaml, save_json, setup_logging, pcc_10digit, resolve_path
 
 
 def parse_args():
@@ -63,6 +63,56 @@ def simulate_one_task(args):
     return lvl, eps, trj, stats
 
 
+def _save_model_csv(path: Path, model_grid: np.ndarray, header: str) -> None:
+    """保存与 all_score 同维度的模型名称 CSV。"""
+    lines = [header]
+    for row in model_grid:
+        lines.append(",".join(str(v) for v in row))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _oof_pcc(result: dict) -> float:
+    return float(result.get("oof_pcc", result["test_pcc"]))
+
+
+def _level_result_entry(result: dict, model: str, eps_str: str) -> dict:
+    """构造 per_level / result.json 记录（同时含 OOF、最优折、折平均）。"""
+    return {
+        "eps": eps_str,
+        "oof_pcc": pcc_10digit(result.get("oof_pcc", result["test_pcc"])),
+        "best_fold_pcc": pcc_10digit(result.get("best_fold_pcc", result["test_pcc"])),
+        "mean_fold_pcc": pcc_10digit(result.get("mean_fold_pcc", result["test_pcc"])),
+        "best_fold": int(result.get("best_fold_idx", 1)),
+        "model": model,
+        "fold_val_pccs": result.get("fold_val_pccs", []),
+    }
+
+
+def _pick_best_regressor(reg_cfg, X, labels, test_size, random_state, cv_folds):
+    """按 OOF PCC 选取最优回归器。"""
+    best_oof, best_model, best_result = -999.0, "RF", None
+    for reg_name, reg_params in reg_cfg.items():
+        if not reg_params.get("enabled", True):
+            continue
+        r = evaluate_regressor(reg_name, X, labels, reg_params,
+                               test_size, random_state, cv_folds)
+        oof = _oof_pcc(r)
+        if oof > best_oof:
+            best_oof = oof
+            best_model = reg_name.upper()
+            best_result = r
+    return best_oof, best_model, best_result
+
+
+def _log_cv_metrics(prefix: str, r: dict, log) -> None:
+    log.info(
+        f"{prefix} OOF={r.get('oof_pcc', r['test_pcc']):.4f} "
+        f"best_fold={r.get('best_fold_idx', 1)}"
+        f"({r.get('best_fold_pcc', r['test_pcc']):.4f}) "
+        f"mean_fold={r.get('mean_fold_pcc', r['test_pcc']):.4f}"
+    )
+
+
 def main():
     args = parse_args()
     cfg = load_yaml(args.config)
@@ -71,9 +121,12 @@ def main():
 
     # ── 路径 ──
     project_root = Path(__file__).resolve().parent
-    code_data_dir = project_root / "code_data" / dataset
-    step1_dir = project_root / "result" / dataset
-    protein_out = project_root / "result" / dataset / pdb_id
+    paths = cfg.get("paths", {})
+    result_root = resolve_path(project_root, paths.get("output_root", project_root / "result"))
+    step1_root = resolve_path(project_root, paths.get("step1_result", result_root))
+    code_data_dir = resolve_path(project_root, paths.get("code_data", project_root / "code_data")) / dataset
+    step1_dir = step1_root / dataset
+    protein_out = result_root / dataset / pdb_id
     protein_out.mkdir(parents=True, exist_ok=True)
 
     # ── 日志 ──
@@ -100,6 +153,7 @@ def main():
     eval_cfg = cfg["evaluation"]
     test_size = eval_cfg["test_size"]
     random_state = eval_cfg["random_state"]
+    cv_folds = eval_cfg.get("cv_folds", 10)
 
     n_jobs = cfg["parallel"]["n_jobs"]
     if n_jobs <= 0:
@@ -131,6 +185,7 @@ def main():
     log.info(f"Protein={pdb_id} dataset={dataset} atoms={n_atoms} levels={num_levels}")
     log.info(f"Eps range: [{eps_list[0]:.1f}, {eps_list[-1]:.1f}] n_jobs={n_jobs}")
     log.info(f"Thresholds: {[round(t,1) for t in thresholds]}")
+    log.info(f"Evaluation: {cv_folds}-fold CV" if cv_folds >= 2 else f"Evaluation: hold-out test_size={test_size}")
 
     # ── 确定演化步数（基于 eps_ref, 中间层 L05） ──
     ref_lvl = min(5, num_levels)
@@ -167,19 +222,46 @@ def main():
         eps_tag = f"{smoke_eps:.1f}".replace(".", "-")
         np.save(traj_dir / f"{pdb_id}_L{smoke_lvl:02d}_eps{eps_tag}_trj.npy", trj_smoke)
 
-        # Quick RF test
-        from src.regression import evaluate_regressor
-        r = evaluate_regressor("rf", trj_smoke, labels, cfg["regressors"].get("rf", {}),
-                                test_size, random_state)
-        log.info(f"RF test PCC={r['test_pcc']:.4f}")
+        # Quick RF test (trj + stats)
+        r_trj = evaluate_regressor("rf", trj_smoke, labels, cfg["regressors"].get("rf", {}),
+                                   test_size, random_state, cv_folds)
+        r_stats = evaluate_regressor("rf", stats_smoke, labels, cfg["regressors"].get("rf", {}),
+                                    test_size, random_state, cv_folds)
+        _log_cv_metrics("RF trj ", r_trj, log)
+        _log_cv_metrics("RF stats", r_stats, log)
+
+        eps_str = f"{smoke_eps:.1f}"
+        lvl_key = f"L{smoke_lvl:02d}"
+        per_trj = _level_result_entry(r_trj, "RF", eps_str)
+        per_stats = _level_result_entry(r_stats, "RF", eps_str)
+        smoke_result = {
+            "pdb_id": pdb_id,
+            "dataset": dataset,
+            "smoke": True,
+            "n_atoms": n_atoms,
+            "n_steps": n_steps,
+            "nu": nu,
+            "dt": dt,
+            "dx": dx,
+            "smoke_config": {"level": smoke_lvl, "eps": smoke_eps},
+            "evaluation": {"cv_folds": cv_folds, "random_state": random_state},
+            "best_combined_trj": {k: v for k, v in per_trj.items() if k != "fold_val_pccs"},
+            "best_combined_stats": {k: v for k, v in per_stats.items() if k != "fold_val_pccs"},
+            "per_level_trj": {lvl_key: per_trj},
+            "per_level_stats": {lvl_key: per_stats},
+            "smoke_trj": r_trj,
+            "smoke_stats": r_stats,
+        }
+        save_json(smoke_result, protein_out / "result.json")
+        log.info(f"Result saved: {protein_out / 'result.json'}")
 
         # Plot
         fig_dir = protein_out / "figures"; fig_dir.mkdir(exist_ok=True)
         pulse_idx = n_atoms // 2
         plot_ux(A_smoke, nu, smoke_eps, pdb_id, smoke_lvl, pulse_idx, dt, dx, n_steps,
-                fig_dir / f"{pdb_id}_smoke_ux.png")
+                fig_dir / f"{pdb_id}_smoke_ux.png", model="RF")
         plot_ut(trj_smoke, nu, smoke_eps, pdb_id, smoke_lvl, dt, max(1, n_steps // n_pts),
-                fig_dir / f"{pdb_id}_smoke_ut.png")
+                fig_dir / f"{pdb_id}_smoke_ut.png", model="RF")
         log.info(f"Smoke test done. Plots: {fig_dir}")
         return 0
 
@@ -242,20 +324,35 @@ def main():
     reg_cfg = cfg["regressors"]
     log.info("Starting regression evaluation...")
 
-    # all_score: rows=eps (100), cols=levels (10)
-    all_score_stats = np.zeros((len(eps_list), num_levels))
-    all_score_trj = np.zeros((len(eps_list), num_levels))
+    # 网格 CSV：同时记录 OOF / 最优折 PCC / 折平均 PCC / 最优折号
+    all_oof_stats = np.zeros((len(eps_list), num_levels))
+    all_bestfold_pcc_stats = np.zeros((len(eps_list), num_levels))
+    all_meanfold_stats = np.zeros((len(eps_list), num_levels))
+    all_bestfold_stats = np.zeros((len(eps_list), num_levels), dtype=int)
+    all_model_stats = np.empty((len(eps_list), num_levels), dtype=object)
+    all_oof_trj = np.zeros((len(eps_list), num_levels))
+    all_bestfold_pcc_trj = np.zeros((len(eps_list), num_levels))
+    all_meanfold_trj = np.zeros((len(eps_list), num_levels))
+    all_bestfold_trj = np.zeros((len(eps_list), num_levels), dtype=int)
+    all_model_trj = np.empty((len(eps_list), num_levels), dtype=object)
+    fold_detail_stats = {}
+    fold_detail_trj = {}
+    for ei in range(len(eps_list)):
+        for lvl in range(num_levels):
+            all_model_stats[ei, lvl] = "RF"
+            all_model_trj[ei, lvl] = "RF"
+            all_bestfold_stats[ei, lvl] = 1
+            all_bestfold_trj[ei, lvl] = 1
 
-    # per-level best tracking
+    # per-level best tracking（按 OOF 选最优 ε）
     best_per_level_stats = {}
     best_per_level_trj = {}
     for lvl in range(1, num_levels + 1):
-        best_per_level_stats[lvl] = {"eps": 0, "pcc": -999}
-        best_per_level_trj[lvl] = {"eps": 0, "pcc": -999}
+        best_per_level_stats[lvl] = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
+        best_per_level_trj[lvl] = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
 
-    # combined (all 10 levels) tracking
-    best_combined_stats = {"eps": 0, "pcc": -999}
-    best_combined_trj = {"eps": 0, "pcc": -999}
+    best_combined_stats = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
+    best_combined_trj = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
 
     # results for all regressors
     all_reg_results = {}
@@ -274,17 +371,23 @@ def main():
             for reg_name, reg_params in reg_cfg.items():
                 if not reg_params.get("enabled", True):
                     continue
-                result = evaluate_regressor(reg_name, X_s, labels, reg_params, test_size, random_state)
+                result = evaluate_regressor(reg_name, X_s, labels, reg_params,
+                                           test_size, random_state, cv_folds)
                 key = f"{reg_name}_stats_eps{eps_str}"
                 all_reg_results[key] = result
             rf_time_stats_total += time.time() - t1
 
-            # Track combined best (RF)
-            rf_key = f"rf_stats_eps{eps_str}"
-            if rf_key in all_reg_results:
-                pcc_val = all_reg_results[rf_key]["test_pcc"]
-                if pcc_val > best_combined_stats["pcc"]:
-                    best_combined_stats = {"eps": eps_str, "pcc": pcc_10digit(pcc_val)}
+            # Track combined best across all regressors
+            for reg_name, reg_params in reg_cfg.items():
+                if not reg_params.get("enabled", True):
+                    continue
+                key = f"{reg_name}_stats_eps{eps_str}"
+                if key not in all_reg_results:
+                    continue
+                r = all_reg_results[key]
+                oof = _oof_pcc(r)
+                if oof > best_combined_stats["oof_pcc"]:
+                    best_combined_stats = _level_result_entry(r, reg_name.upper(), eps_str)
 
         if feat_cfg["trajectory"]["enabled"]:
             t1 = time.time()
@@ -293,45 +396,108 @@ def main():
             for reg_name, reg_params in reg_cfg.items():
                 if not reg_params.get("enabled", True):
                     continue
-                result = evaluate_regressor(reg_name, X_t, labels, reg_params, test_size, random_state)
+                result = evaluate_regressor(reg_name, X_t, labels, reg_params,
+                                           test_size, random_state, cv_folds)
                 key = f"{reg_name}_trj_eps{eps_str}"
                 all_reg_results[key] = result
             rf_time_trj_total += time.time() - t1
 
-            rf_key = f"rf_trj_eps{eps_str}"
-            if rf_key in all_reg_results:
-                pcc_val = all_reg_results[rf_key]["test_pcc"]
-                if pcc_val > best_combined_trj["pcc"]:
-                    best_combined_trj = {"eps": eps_str, "pcc": pcc_10digit(pcc_val)}
+            for reg_name, reg_params in reg_cfg.items():
+                if not reg_params.get("enabled", True):
+                    continue
+                key = f"{reg_name}_trj_eps{eps_str}"
+                if key not in all_reg_results:
+                    continue
+                r = all_reg_results[key]
+                oof = _oof_pcc(r)
+                if oof > best_combined_trj["oof_pcc"]:
+                    best_combined_trj = _level_result_entry(r, reg_name.upper(), eps_str)
 
         # ── Per-level ──
         for lvl in range(1, num_levels + 1):
             # Stats
             if feat_cfg["stats"]["enabled"]:
                 s = all_stats_features[(lvl, eps_str)]
-                r = evaluate_regressor("rf", s, labels,
-                                        reg_cfg.get("rf", {}), test_size, random_state)
-                all_score_stats[ei, lvl - 1] = pcc_10digit(r["test_pcc"])
-                if r["test_pcc"] > best_per_level_stats[lvl]["pcc"]:
-                    best_per_level_stats[lvl] = {"eps": eps_str, "pcc": pcc_10digit(r["test_pcc"])}
+                _, best_cell_model, best_r = _pick_best_regressor(
+                    reg_cfg, s, labels, test_size, random_state, cv_folds)
+                if best_r is None:
+                    continue
+                all_oof_stats[ei, lvl - 1] = pcc_10digit(_oof_pcc(best_r))
+                all_bestfold_pcc_stats[ei, lvl - 1] = pcc_10digit(best_r.get("best_fold_pcc", best_r["test_pcc"]))
+                all_meanfold_stats[ei, lvl - 1] = pcc_10digit(best_r.get("mean_fold_pcc", best_r["test_pcc"]))
+                all_bestfold_stats[ei, lvl - 1] = int(best_r.get("best_fold_idx", 1))
+                all_model_stats[ei, lvl - 1] = best_cell_model
+                fold_detail_stats.setdefault(eps_str, {})[f"L{lvl:02d}"] = {
+                    "model": best_cell_model,
+                    "oof_pcc": best_r.get("oof_pcc", best_r["test_pcc"]),
+                    "best_fold_pcc": best_r.get("best_fold_pcc", best_r["test_pcc"]),
+                    "mean_fold_pcc": best_r.get("mean_fold_pcc", best_r["test_pcc"]),
+                    "best_fold": int(best_r.get("best_fold_idx", 1)),
+                    "fold_val_pccs": best_r.get("fold_val_pccs", []),
+                }
+                entry = _level_result_entry(best_r, best_cell_model, eps_str)
+                if _oof_pcc(best_r) > best_per_level_stats[lvl]["oof_pcc"]:
+                    best_per_level_stats[lvl] = entry
 
-            # Trajectory
             if feat_cfg["trajectory"]["enabled"]:
                 t = all_trj[(lvl, eps_str)]
-                r = evaluate_regressor("rf", t, labels,
-                                        reg_cfg.get("rf", {}), test_size, random_state)
-                all_score_trj[ei, lvl - 1] = pcc_10digit(r["test_pcc"])
-                if r["test_pcc"] > best_per_level_trj[lvl]["pcc"]:
-                    best_per_level_trj[lvl] = {"eps": eps_str, "pcc": pcc_10digit(r["test_pcc"])}
+                _, best_cell_model, best_r = _pick_best_regressor(
+                    reg_cfg, t, labels, test_size, random_state, cv_folds)
+                if best_r is None:
+                    continue
+                all_oof_trj[ei, lvl - 1] = pcc_10digit(_oof_pcc(best_r))
+                all_bestfold_pcc_trj[ei, lvl - 1] = pcc_10digit(best_r.get("best_fold_pcc", best_r["test_pcc"]))
+                all_meanfold_trj[ei, lvl - 1] = pcc_10digit(best_r.get("mean_fold_pcc", best_r["test_pcc"]))
+                all_bestfold_trj[ei, lvl - 1] = int(best_r.get("best_fold_idx", 1))
+                all_model_trj[ei, lvl - 1] = best_cell_model
+                fold_detail_trj.setdefault(eps_str, {})[f"L{lvl:02d}"] = {
+                    "model": best_cell_model,
+                    "oof_pcc": best_r.get("oof_pcc", best_r["test_pcc"]),
+                    "best_fold_pcc": best_r.get("best_fold_pcc", best_r["test_pcc"]),
+                    "mean_fold_pcc": best_r.get("mean_fold_pcc", best_r["test_pcc"]),
+                    "best_fold": int(best_r.get("best_fold_idx", 1)),
+                    "fold_val_pccs": best_r.get("fold_val_pccs", []),
+                }
+                entry = _level_result_entry(best_r, best_cell_model, eps_str)
+                if _oof_pcc(best_r) > best_per_level_trj[lvl]["oof_pcc"]:
+                    best_per_level_trj[lvl] = entry
 
-        log.info(f"eps={eps_str} done: best_per_lvl_stats={best_per_level_stats[6]['pcc']:.4f}")
+        lvl6 = best_per_level_stats.get(6, {})
+        log.info(
+            f"eps={eps_str} done: stats "
+            f"OOF={lvl6.get('oof_pcc', 0):.4f} "
+            f"best_fold={lvl6.get('best_fold', 1)}"
+            f"({lvl6.get('best_fold_pcc', 0):.4f}) "
+            f"mean_fold={lvl6.get('mean_fold_pcc', 0):.4f} "
+            f"model={lvl6.get('model', 'RF')}"
+        )
 
-    # ── 保存 all_score CSV ──
+    # ── 保存 OOF / 最优折 / 折平均 / 折号 / 模型 CSV ──
     header = ",".join([f"L{lvl:02d}" for lvl in range(1, num_levels + 1)])
-    np.savetxt(all_score_dir / f"{pdb_id}_all_score_stats.csv", all_score_stats,
+    np.savetxt(all_score_dir / f"{pdb_id}_all_oof_stats.csv", all_oof_stats,
                delimiter=",", header=header, comments="", fmt="%.10g")
-    np.savetxt(all_score_dir / f"{pdb_id}_all_score_trj.csv", all_score_trj,
+    np.savetxt(all_score_dir / f"{pdb_id}_all_oof_trj.csv", all_oof_trj,
                delimiter=",", header=header, comments="", fmt="%.10g")
+    np.savetxt(all_score_dir / f"{pdb_id}_all_bestfold_pcc_stats.csv", all_bestfold_pcc_stats,
+               delimiter=",", header=header, comments="", fmt="%.10g")
+    np.savetxt(all_score_dir / f"{pdb_id}_all_bestfold_pcc_trj.csv", all_bestfold_pcc_trj,
+               delimiter=",", header=header, comments="", fmt="%.10g")
+    np.savetxt(all_score_dir / f"{pdb_id}_all_meanfold_stats.csv", all_meanfold_stats,
+               delimiter=",", header=header, comments="", fmt="%.10g")
+    np.savetxt(all_score_dir / f"{pdb_id}_all_meanfold_trj.csv", all_meanfold_trj,
+               delimiter=",", header=header, comments="", fmt="%.10g")
+    np.savetxt(all_score_dir / f"{pdb_id}_all_bestfold_stats.csv", all_bestfold_stats,
+               delimiter=",", header=header, comments="", fmt="%d")
+    np.savetxt(all_score_dir / f"{pdb_id}_all_bestfold_trj.csv", all_bestfold_trj,
+               delimiter=",", header=header, comments="", fmt="%d")
+    _save_model_csv(all_score_dir / f"{pdb_id}_all_model_stats.csv", all_model_stats, header)
+    _save_model_csv(all_score_dir / f"{pdb_id}_all_model_trj.csv", all_model_trj, header)
+    save_json({
+        "cv_folds": cv_folds,
+        "stats": fold_detail_stats,
+        "trj": fold_detail_trj,
+    }, all_score_dir / f"{pdb_id}_fold_detail.json")
+    log.info(f"Saved all_oof / all_bestfold_pcc / all_meanfold / fold_detail: {all_score_dir}")
 
     # ── 保存 result.json ──
     result = {
@@ -339,6 +505,7 @@ def main():
         "n_steps": n_steps, "nu": nu, "dt": dt, "dx": dx,
         "eps_range": [eps_start, eps_stop, eps_step],
         "thresholds": [round(t, 1) for t in thresholds],
+        "evaluation": {"cv_folds": cv_folds, "random_state": random_state},
         "simulation_time_s": int(sim_time),
         "rf_time_stats_s": round(rf_time_stats_total, 1),
         "rf_time_trj_s": round(rf_time_trj_total, 1),
@@ -350,21 +517,44 @@ def main():
     save_json(result, protein_out / "result.json")
 
     # ── 绘图（最优 eps, 统计量特征的最佳层） ──
-    best_eps = float(best_combined_stats["eps"])
+    best_eps_str = best_combined_stats["eps"]
+    best_eps = float(best_eps_str)
     best_lvl = max(range(1, num_levels + 1),
-                   key=lambda l: best_per_level_stats[l]["pcc"])
+                   key=lambda l: best_per_level_stats[l].get("oof_pcc", -999))
+    best_plot_model = best_per_level_stats[best_lvl].get("model", "RF")
+    best_ei = next((i for i, e in enumerate(eps_list) if f"{e:.1f}" == best_eps_str), 0)
+    if feat_cfg["stats"]["enabled"]:
+        best_plot_model = str(all_model_stats[best_ei, best_lvl - 1])
+
     pulse_idx = n_atoms // 2
 
     A_best = aij_matrices[best_lvl - 1]
-    trj_best = all_trj[(best_lvl, best_combined_stats["eps"])]
+    trj_best = all_trj[(best_lvl, best_eps_str)]
 
     plot_ux(A_best, nu, best_eps, pdb_id, best_lvl, pulse_idx, dt, dx, n_steps,
-            fig_dir / "ux.png")
+            fig_dir / "ux.png", model=best_plot_model)
     plot_ut(trj_best, nu, best_eps, pdb_id, best_lvl, dt, max(1, n_steps // n_pts),
-            fig_dir / "ut.png")
-    log.info(f"Plots saved: ux.png, ut.png (best level={best_lvl}, eps={best_eps})")
+            fig_dir / "ut.png", model=best_plot_model)
+    log.info(
+        f"Plots saved: ux.png, ut.png "
+        f"(level={best_lvl}, eps={best_eps}, model={best_plot_model})"
+    )
 
-    log.info(f"Done. Best stats PCC={best_combined_stats['pcc']:.4f}")
+    bc = best_combined_stats
+    bt = best_combined_trj
+    log.info(
+        f"Done. Best stats: OOF={bc.get('oof_pcc', 0):.4f} "
+        f"best_fold={bc.get('best_fold', 1)}({bc.get('best_fold_pcc', 0):.4f}) "
+        f"mean_fold={bc.get('mean_fold_pcc', 0):.4f} "
+        f"eps={bc.get('eps')} model={bc.get('model', 'RF')}"
+    )
+    log.info(
+        f"Best trj: OOF={bt.get('oof_pcc', 0):.4f} "
+        f"best_fold={bt.get('best_fold', 1)}({bt.get('best_fold_pcc', 0):.4f}) "
+        f"mean_fold={bt.get('mean_fold_pcc', 0):.4f} "
+        f"eps={bt.get('eps')} model={bt.get('model', 'RF')}"
+    )
+    log.info(f"Result saved: {protein_out / 'result.json'}")
     log.info(f"Result dir: {protein_out}")
     return 0
 

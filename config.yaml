@@ -1,3 +1,6 @@
+# Author: Zihan Wang
+# <wangzh011031@163.com>
+
 # ── 数据集 ──
 datasets:
   - 33small
@@ -6,11 +9,11 @@ datasets:
 
 # ── 路径 ──
 paths:
-  project_root: ../
-  code_data: ../code_data
-  step1_result: ../result
-  output_root: ./result
-  pdb_dir: ../protein
+  project_root: /mnt/home/jiangj33/Pcode
+  code_data: /mnt/home/jiangj33/Pcode/code_data
+  pdb_dir: /mnt/home/jiangj33/Pcode/protein
+  output_root: /mnt/gs21/scratch/jiangj33/Bfactor_result
+  step1_result: /mnt/gs21/scratch/jiangj33/Bfactor_result
 
 # ── 动力学参数 ──
 dynamics:
@@ -69,7 +72,8 @@ regressors:
 
 # ── 评估 ──
 evaluation:
-  test_size: 0.2
+  cv_folds: 10                 # >=2 启用 K 折交叉验证；<2 回退 hold-out
+  test_size: 0.2                # 仅 hold-out 模式使用
   random_state: 42
 
 # ── 并行 ──

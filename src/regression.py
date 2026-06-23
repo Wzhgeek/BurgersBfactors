@@ -9,6 +9,13 @@
   - SVR:  SVR + StandardScaler (sklearn)
   - LR:   Ridge 线性回归 (L2 正则)
   - LSTM: PyTorch LSTM 模型 (hidden_size, num_layers 可配置)
+
+评估:
+  - cv_folds >= 2: K 折交叉验证（默认 10 折）
+  - test_pcc: OOF 整体 PCC（无偏，适合正式比较）
+  - best_fold_pcc / best_fold_idx: 各折验证 PCC 的最大值及折号（1-based）
+  - mean_fold_pcc: 各折验证 PCC 的算术平均
+  - cv_folds < 2:  单次 train/test 划分（hold-out）
 """
 
 import time
@@ -20,7 +27,7 @@ from scipy.stats import pearsonr
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, train_test_split
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
@@ -47,7 +54,6 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
     y_true = np.asarray(y_true, dtype=np.float64).ravel()
     y_pred = np.asarray(y_pred, dtype=np.float64).ravel()
 
-    # ---- PCC ----
     std_true = float(np.std(y_true))
     std_pred = float(np.std(y_pred))
     if std_true < 1e-14 or std_pred < 1e-14:
@@ -59,13 +65,8 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
         pcc_raw = float(pcc_stat) if not np.isnan(pcc_stat) else 0.0
 
     pcc_val = _pcc_10digit(pcc_raw)
-
-    # ---- RMSE ----
     rmse_val = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-
-    # ---- R² ----
     r2_val = float(r2_score(y_true, y_pred))
-
     return pcc_val, rmse_val, r2_val
 
 
@@ -82,18 +83,16 @@ class _LSTMModel(nn.Module):
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        # 取最后一个时间步的输出
         return self.fc(out[:, -1, :])
 
 
-def _train_lstm(model, X_train, y_train, X_test, y_test,
-                epochs=200, lr=0.001, device="cpu"):
-    """训练 LSTM，返回 (train_pred, test_pred) numpy 数组。"""
+def _train_lstm_predict(model, X_train, y_train, X_pred,
+                        epochs=200, lr=0.001, device="cpu"):
+    """训练 LSTM 并预测 X_pred。"""
     model = model.to(device)
-
     X_train_t = torch.FloatTensor(X_train).to(device)
     y_train_t = torch.FloatTensor(y_train).to(device)
-    X_test_t = torch.FloatTensor(X_test).to(device)
+    X_pred_t = torch.FloatTensor(X_pred).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
@@ -108,60 +107,21 @@ def _train_lstm(model, X_train, y_train, X_test, y_test,
 
     model.eval()
     with torch.no_grad():
-        train_pred = model(X_train_t).squeeze(-1).cpu().numpy()
-        test_pred = model(X_test_t).squeeze(-1).cpu().numpy()
-
-    return train_pred, test_pred
+        return model(X_pred_t).squeeze(-1).cpu().numpy()
 
 
-# ── 统一评估入口 ───────────────────────────────────────────────────────
-
-def evaluate_regressor(name: str,
-                       X: np.ndarray,
-                       y: np.ndarray,
-                       params: dict | None = None,
-                       test_size: float = 0.2,
-                       random_state: int = 42) -> dict:
-    """
-    训练并评估一个回归器。
-
-    Parameters
-    ----------
-    name : str
-        算法名: 'RF', 'KNN', 'SVR', 'LR', 'LSTM'。
-    X : np.ndarray  shape (n_samples, n_features)
-        特征矩阵。
-    y : np.ndarray  shape (n_samples,)
-        目标向量。
-    params : dict | None
-        模型超参数字典。不传则使用默认值。
-    test_size : float
-        测试集比例。
-    random_state : int
-        随机种子。
-
-    Returns
-    -------
-    dict
-        train_pcc, test_pcc, train_rmse, test_rmse,
-        train_r2, test_r2, time_s
-    """
-    if params is None:
-        params = {}
-
+def _fit_and_predict_pair(
+    name: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_a: np.ndarray,
+    X_b: np.ndarray,
+    params: dict,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """拟合一次，分别对 X_a、X_b 预测。"""
     name = name.upper()
 
-    # 1. 标准化特征
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-
-    # 2. 划分训练 / 测试
-    X_train, X_test, y_train, y_test = train_test_split(
-        Xs, y, test_size=test_size, random_state=random_state)
-
-    t_start = time.time()
-
-    # 3. 按算法名训练
     if name == "RF":
         model = RandomForestRegressor(
             n_estimators=params.get("n_estimators", 200),
@@ -170,24 +130,20 @@ def evaluate_regressor(name: str,
             n_jobs=params.get("n_jobs", 1),
         )
         model.fit(X_train, y_train)
-        train_pred = model.predict(X_train)
-        test_pred = model.predict(X_test)
+        return model.predict(X_a), model.predict(X_b)
 
-    elif name == "KNN":
+    if name == "KNN":
         model = KNeighborsRegressor(
             n_neighbors=params.get("n_neighbors", 5),
             weights=params.get("weights", "uniform"),
             n_jobs=params.get("n_jobs", 1),
         )
         model.fit(X_train, y_train)
-        train_pred = model.predict(X_train)
-        test_pred = model.predict(X_test)
+        return model.predict(X_a), model.predict(X_b)
 
-    elif name == "SVR":
-        # SVR 默认对特征尺度敏感，内部再做一次 StandardScaler
+    if name == "SVR":
         svr_scaler = StandardScaler()
         X_train_s = svr_scaler.fit_transform(X_train)
-        X_test_s = svr_scaler.transform(X_test)
         model = SVR(
             kernel=params.get("kernel", "rbf"),
             C=params.get("C", 1.0),
@@ -195,55 +151,248 @@ def evaluate_regressor(name: str,
             gamma=params.get("gamma", "scale"),
         )
         model.fit(X_train_s, y_train)
-        train_pred = model.predict(X_train_s)
-        test_pred = model.predict(X_test_s)
+        return model.predict(svr_scaler.transform(X_a)), model.predict(svr_scaler.transform(X_b))
 
-    elif name == "LR":
+    if name == "LR":
         model = Ridge(
             alpha=params.get("alpha", 1.0),
             random_state=params.get("random_state", random_state),
         )
         model.fit(X_train, y_train)
-        train_pred = model.predict(X_train)
-        test_pred = model.predict(X_test)
+        return model.predict(X_a), model.predict(X_b)
 
-    elif name == "LSTM":
-        # 将 X 变形为 (batch, seq_len, 1)
-        X_train_l = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
-        X_test_l = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
-
-        hidden_size = params.get("hidden_size", 64)
-        num_layers = params.get("num_layers", 2)
+    if name == "LSTM":
+        n_feat = X_train.shape[1]
+        lstm_model = _LSTMModel(
+            input_size=1,
+            hidden_size=params.get("hidden_size", 64),
+            num_layers=params.get("num_layers", 2),
+        )
         epochs = params.get("epochs", 200)
         lr = params.get("lr", 0.001)
+        pred_a = _train_lstm_predict(
+            lstm_model, X_train.reshape(-1, n_feat, 1), y_train,
+            X_a.reshape(-1, n_feat, 1), epochs=epochs, lr=lr,
+        )
+        lstm_model2 = _LSTMModel(
+            input_size=1,
+            hidden_size=params.get("hidden_size", 64),
+            num_layers=params.get("num_layers", 2),
+        )
+        pred_b = _train_lstm_predict(
+            lstm_model2, X_train.reshape(-1, n_feat, 1), y_train,
+            X_b.reshape(-1, n_feat, 1), epochs=epochs, lr=lr,
+        )
+        return pred_a, pred_b
 
-        lstm_model = _LSTMModel(input_size=1,
-                                hidden_size=hidden_size,
-                                num_layers=num_layers)
-        train_pred, test_pred = _train_lstm(
-            lstm_model, X_train_l, y_train, X_test_l, y_test,
-            epochs=epochs, lr=lr,
+    raise ValueError(
+        f"Unknown regressor: '{name}'. Choose from RF, KNN, SVR, LR, LSTM."
+    )
+
+
+def _fit_and_predict(
+    name: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_pred: np.ndarray,
+    params: dict,
+    random_state: int,
+) -> np.ndarray:
+    """在训练集上拟合，对 X_pred 样本预测。"""
+    name = name.upper()
+
+    if name == "RF":
+        model = RandomForestRegressor(
+            n_estimators=params.get("n_estimators", 200),
+            max_depth=params.get("max_depth", 5),
+            random_state=params.get("random_state", random_state),
+            n_jobs=params.get("n_jobs", 1),
+        )
+        model.fit(X_train, y_train)
+        return model.predict(X_pred)
+
+    if name == "KNN":
+        model = KNeighborsRegressor(
+            n_neighbors=params.get("n_neighbors", 5),
+            weights=params.get("weights", "uniform"),
+            n_jobs=params.get("n_jobs", 1),
+        )
+        model.fit(X_train, y_train)
+        return model.predict(X_pred)
+
+    if name == "SVR":
+        svr_scaler = StandardScaler()
+        X_train_s = svr_scaler.fit_transform(X_train)
+        X_pred_s = svr_scaler.transform(X_pred)
+        model = SVR(
+            kernel=params.get("kernel", "rbf"),
+            C=params.get("C", 1.0),
+            epsilon=params.get("epsilon", 0.1),
+            gamma=params.get("gamma", "scale"),
+        )
+        model.fit(X_train_s, y_train)
+        return model.predict(X_pred_s)
+
+    if name == "LR":
+        model = Ridge(
+            alpha=params.get("alpha", 1.0),
+            random_state=params.get("random_state", random_state),
+        )
+        model.fit(X_train, y_train)
+        return model.predict(X_pred)
+
+    if name == "LSTM":
+        n_feat = X_train.shape[1]
+        X_train_l = X_train.reshape(X_train.shape[0], n_feat, 1)
+        X_pred_l = X_pred.reshape(X_pred.shape[0], n_feat, 1)
+        lstm_model = _LSTMModel(
+            input_size=1,
+            hidden_size=params.get("hidden_size", 64),
+            num_layers=params.get("num_layers", 2),
+        )
+        return _train_lstm_predict(
+            lstm_model, X_train_l, y_train, X_pred_l,
+            epochs=params.get("epochs", 200),
+            lr=params.get("lr", 0.001),
         )
 
-    else:
-        raise ValueError(
-            f"Unknown regressor: '{name}'. "
-            f"Choose from RF, KNN, SVR, LR, LSTM."
-        )
+    raise ValueError(
+        f"Unknown regressor: '{name}'. Choose from RF, KNN, SVR, LR, LSTM."
+    )
 
-    t_end = time.time()
-    elapsed = float(t_end - t_start)
 
-    # 4. 计算指标
+def _evaluate_holdout(
+    name: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    params: dict,
+    test_size: float,
+    random_state: int,
+) -> dict:
+    """单次 train/test 划分评估。"""
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        Xs, y, test_size=test_size, random_state=random_state)
+
+    t_start = time.time()
+    train_pred, test_pred = _fit_and_predict_pair(
+        name, X_train, y_train, X_train, X_test, params, random_state)
+    elapsed = time.time() - t_start
+
     train_pcc, train_rmse, train_r2 = _compute_metrics(y_train, train_pred)
     test_pcc, test_rmse, test_r2 = _compute_metrics(y_test, test_pred)
 
     return {
+        "cv_mode": "holdout",
+        "cv_folds": 1,
         "train_pcc": train_pcc,
         "test_pcc": test_pcc,
+        "oof_pcc": test_pcc,
+        "best_fold_pcc": test_pcc,
+        "best_fold_idx": 1,
+        "mean_fold_pcc": test_pcc,
+        "test_pcc_std": 0.0,
+        "fold_val_pccs": [test_pcc],
         "train_rmse": train_rmse,
         "test_rmse": test_rmse,
         "train_r2": train_r2,
         "test_r2": test_r2,
-        "time_s": elapsed,
+        "time_s": float(elapsed),
     }
+
+
+def _evaluate_kfold(
+    name: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    params: dict,
+    cv_folds: int,
+    random_state: int,
+) -> dict:
+    """K 折交叉验证：test_pcc 为 OOF 预测的整体 PCC。"""
+    n_samples = len(y)
+    n_splits = min(cv_folds, n_samples)
+    if n_splits < 2:
+        return _evaluate_holdout(name, X, y, params, test_size=0.2, random_state=random_state)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    oof_pred = np.zeros(n_samples, dtype=np.float64)
+    fold_val_pccs = []
+    fold_train_pccs = []
+
+    t_start = time.time()
+    for train_idx, val_idx in kf.split(X):
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X[train_idx])
+        X_val = scaler.transform(X[val_idx])
+        y_train = y[train_idx]
+        y_val = y[val_idx]
+
+        train_pred, val_pred = _fit_and_predict_pair(
+            name, X_train, y_train, X_train, X_val, params, random_state)
+
+        oof_pred[val_idx] = val_pred
+        vpcc, _, _ = _compute_metrics(y_val, val_pred)
+        tpcc, _, _ = _compute_metrics(y_train, train_pred)
+        fold_val_pccs.append(vpcc)
+        fold_train_pccs.append(tpcc)
+
+    elapsed = time.time() - t_start
+
+    test_pcc, test_rmse, test_r2 = _compute_metrics(y, oof_pred)
+    test_pcc_std = float(np.std(fold_val_pccs)) if fold_val_pccs else 0.0
+    train_pcc = float(np.mean(fold_train_pccs)) if fold_train_pccs else 0.0
+    mean_fold_pcc = float(np.mean(fold_val_pccs)) if fold_val_pccs else test_pcc
+    best_fold_idx = int(np.argmax(fold_val_pccs)) + 1 if fold_val_pccs else 1
+    best_fold_pcc = float(fold_val_pccs[best_fold_idx - 1]) if fold_val_pccs else test_pcc
+
+    return {
+        "cv_mode": "kfold",
+        "cv_folds": n_splits,
+        "train_pcc": _pcc_10digit(train_pcc),
+        "test_pcc": test_pcc,
+        "oof_pcc": test_pcc,
+        "best_fold_pcc": _pcc_10digit(best_fold_pcc),
+        "best_fold_idx": best_fold_idx,
+        "mean_fold_pcc": _pcc_10digit(mean_fold_pcc),
+        "test_pcc_std": _pcc_10digit(test_pcc_std),
+        "fold_val_pccs": [_pcc_10digit(p) for p in fold_val_pccs],
+        "train_rmse": 0.0,
+        "test_rmse": test_rmse,
+        "train_r2": 0.0,
+        "test_r2": test_r2,
+        "time_s": float(elapsed),
+    }
+
+
+# ── 统一评估入口 ───────────────────────────────────────────────────────
+
+def evaluate_regressor(
+    name: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    params: dict | None = None,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    cv_folds: int = 10,
+) -> dict:
+    """
+    训练并评估一个回归器。
+
+    cv_folds >= 2 时使用 K 折交叉验证（每折内单独标准化特征）；
+    test_pcc / oof_pcc 为全部 OOF 预测对真实标签的整体 PCC。
+
+    Returns
+    -------
+    dict
+        oof_pcc, best_fold_pcc, best_fold_idx, mean_fold_pcc, fold_val_pccs,
+        train_pcc, test_pcc, test_pcc_std, cv_mode, cv_folds, ...
+    """
+    if params is None:
+        params = {}
+
+    if cv_folds >= 2:
+        return _evaluate_kfold(name, X, y, params, cv_folds, random_state)
+    return _evaluate_holdout(name, X, y, params, test_size, random_state)

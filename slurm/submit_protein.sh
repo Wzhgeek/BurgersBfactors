@@ -1,10 +1,13 @@
 #!/bin/bash
-#SBATCH --cpus-per-task=10
-#SBATCH --mem=16G
-#SBATCH --time=04:00:00
+# Author: Zihan Wang
+# <wangzh011031@163.com>
+#SBATCH --partition=general-long
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
 
-# Usage: sbatch --job-name=33small_1Q9B submit_protein.sh 33small 1Q9B
-# Or submit via submit_all.sh
+# 兼容旧用法；推荐使用: bash slurm/pcode_job.sh submit <dataset> <protein>
+# Usage: sbatch --job-name=pcode_33small_1Q9B submit_protein.sh 33small 1Q9B
 
 DATASET=$1
 PROTEIN=$2
@@ -37,7 +40,15 @@ echo "========================================="
 cd "$(dirname "$0")/.." || exit 1
 echo "Working dir: $(pwd)"
 
-python run.py --dataset "$DATASET" --protein "$PROTEIN"
+CONDA_SH="/mnt/home/jiangj33/anaconda3/etc/profile.d/conda.sh"
+CONDA_ENV="eeg"
+PYTHON="/mnt/home/jiangj33/anaconda3/envs/eeg/bin/python"
+
+source "$CONDA_SH"
+conda activate "$CONDA_ENV"
+echo "Python: $($PYTHON --version 2>&1)"
+
+"$PYTHON" run.py --dataset "$DATASET" --protein "$PROTEIN"
 EXIT_CODE=$?
 
 echo "========================================="
