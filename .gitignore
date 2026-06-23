@@ -1,0 +1,22 @@
+# Author: Zihan Wang
+# <wangzh011031@163.com>
+
+# macOS metadata
+._*
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Generated outputs
+result/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp

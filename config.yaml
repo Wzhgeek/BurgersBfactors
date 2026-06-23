@@ -1,0 +1,81 @@
+# ── 数据集 ──
+datasets:
+  - 33small
+  - 35large
+  - 36med
+
+# ── 路径 ──
+paths:
+  project_root: ../
+  code_data: ../code_data
+  step1_result: ../result
+  output_root: ./result
+  pdb_dir: ../protein
+
+# ── 动力学参数 ──
+dynamics:
+  dt: 0.001
+  dx: 1.0
+  nu: 0.001
+  coupling_mode: graph_diffusion
+  n_steps_ref_eps: 0.1        # 参考ε用于确定演化步数
+  decay_threshold: 0.1         # u衰减到多少为止
+
+# ── 耦合强度扫描 ──
+epsilon:
+  start: 0.1
+  stop: 10.0
+  step: 0.1
+
+# ── 图结构 ──
+graph:
+  num_levels: 10
+  percentile_start: 5
+  percentile_stop: 95
+  aij_k: 1                    # exp(-d^k/(k*sigma^k))
+
+# ── 特征 ──
+features:
+  stats:
+    enabled: true
+    names: [max, min, mean, var, median, std]
+  trajectory:
+    enabled: true
+    n_points: 100              # 采样100个时间点
+
+# ── 回归器 ──
+regressors:
+  rf:
+    enabled: true
+    n_estimators: 200
+    max_depth: 5
+    random_state: 42
+  knn:
+    enabled: true
+    n_neighbors: 5
+  svr:
+    enabled: true
+    kernel: rbf
+    C: 1.0
+  lr:
+    enabled: true
+    alpha: 1.0
+  lstm:
+    enabled: false
+    hidden_size: 16
+    num_layers: 1
+    epochs: 300
+    lr: 0.002
+
+# ── 评估 ──
+evaluation:
+  test_size: 0.2
+  random_state: 42
+
+# ── 并行 ──
+parallel:
+  n_jobs: -1                   # -1 = all cores
+
+# ── 日志 ──
+logging:
+  level: INFO
