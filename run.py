@@ -24,7 +24,16 @@ from src.burgers import rk4_step
 from src.features import extract_stats_features, simulate_trajectories, load_aij_matrices
 from src.regression import evaluate_regressor
 from src.plot import plot_ux, plot_ut
-from src.utils import load_yaml, save_json, setup_logging, pcc_10digit, resolve_path
+from src.utils import (
+    evaluation_for_json,
+    format_eval_log,
+    load_yaml,
+    pcc_10digit,
+    resolve_evaluation,
+    resolve_path,
+    save_json,
+    setup_logging,
+)
 
 
 def parse_args():
@@ -161,14 +170,6 @@ def load_saved_simulation(
     return all_trj, all_stats_features
 
 
-def _eval_meta(eval_cfg: dict) -> tuple[bool, int, float, int]:
-    use_cv = bool(eval_cfg.get("use_cv", True))
-    test_size = float(eval_cfg.get("test_size", 0.2))
-    random_state = int(eval_cfg.get("random_state", 42))
-    cv_folds = int(eval_cfg.get("cv_folds", 10)) if use_cv else 0
-    return use_cv, cv_folds, test_size, random_state
-
-
 def main():
     args = parse_args()
     cfg = load_yaml(args.config)
@@ -207,7 +208,6 @@ def main():
     n_pts = feat_cfg["trajectory"]["n_points"]
 
     eval_cfg = cfg["evaluation"]
-    use_cv, cv_folds, test_size, random_state = _eval_meta(eval_cfg)
     pipeline_cfg = cfg.get("pipeline", {})
     mode = (args.mode or pipeline_cfg.get("mode", "full")).lower()
     if mode not in ("full", "sim_only", "regression_only"):
@@ -236,6 +236,13 @@ def main():
     labels = np.load(label_path).astype(np.float64)
     n_atoms = len(labels)
 
+    eval_res = resolve_evaluation(n_atoms, eval_cfg)
+    use_cv = eval_res["use_cv"]
+    cv_folds = eval_res["cv_folds"]
+    test_size = eval_res["test_size"]
+    random_state = eval_res["random_state"]
+    eval_json = evaluation_for_json(eval_res)
+
     # ── 分位数阈值 ──
     dist = np.load(step1_dir / pdb_id / "distance" / f"{pdb_id}_dist.npy")
     off = dist[dist > 0]
@@ -246,10 +253,7 @@ def main():
     log.info(f"Pipeline mode: {mode}")
     log.info(f"Eps range: [{eps_list[0]:.1f}, {eps_list[-1]:.1f}] n_jobs={n_jobs}")
     log.info(f"Thresholds: {[round(t,1) for t in thresholds]}")
-    if use_cv:
-        log.info(f"Evaluation: {cv_folds}-fold CV")
-    else:
-        log.info(f"Evaluation: hold-out test_size={test_size} (single_pcc)")
+    log.info(f"Evaluation: {format_eval_log(eval_res)} (n_atoms={n_atoms})")
 
     # ── 确定演化步数（基于 eps_ref, 中间层 L05） ──
     ref_lvl = min(5, num_levels)
@@ -309,12 +313,7 @@ def main():
             "dt": dt,
             "dx": dx,
             "smoke_config": {"level": smoke_lvl, "eps": smoke_eps},
-            "evaluation": {
-                "use_cv": use_cv,
-                "cv_folds": cv_folds,
-                "test_size": test_size,
-                "random_state": random_state,
-            },
+            "evaluation": eval_json,
             "best_combined_trj": {k: v for k, v in per_trj.items() if k != "fold_val_pccs"},
             "best_combined_stats": {k: v for k, v in per_stats.items() if k != "fold_val_pccs"},
             "per_level_trj": {lvl_key: per_trj},
@@ -401,12 +400,7 @@ def main():
             "dx": dx,
             "eps_range": [eps_start, eps_stop, eps_step],
             "thresholds": [round(t, 1) for t in thresholds],
-            "evaluation": {
-                "use_cv": use_cv,
-                "cv_folds": cv_folds,
-                "test_size": test_size,
-                "random_state": random_state,
-            },
+            "evaluation": eval_json,
             "simulation_time_s": int(sim_time),
         }
         save_json(sim_result, protein_out / "result.json")
@@ -634,8 +628,7 @@ def main():
         np.savetxt(all_score_dir / f"{pdb_id}_all_single_pcc_trj.csv", all_single_pcc_trj,
                    delimiter=",", header=header, comments="", fmt="%.10g")
     save_json({
-        "use_cv": use_cv,
-        "cv_folds": cv_folds,
+        **evaluation_for_json(eval_res),
         "stats": fold_detail_stats,
         "trj": fold_detail_trj,
     }, all_score_dir / f"{pdb_id}_fold_detail.json")
@@ -648,12 +641,7 @@ def main():
         "n_steps": n_steps, "nu": nu, "dt": dt, "dx": dx,
         "eps_range": [eps_start, eps_stop, eps_step],
         "thresholds": [round(t, 1) for t in thresholds],
-        "evaluation": {
-            "use_cv": use_cv,
-            "cv_folds": cv_folds,
-            "test_size": test_size,
-            "random_state": random_state,
-        },
+        "evaluation": eval_json,
         "simulation_time_s": int(sim_time),
         "rf_time_stats_s": round(rf_time_stats_total, 1),
         "rf_time_trj_s": round(rf_time_trj_total, 1),

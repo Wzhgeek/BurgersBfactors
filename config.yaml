@@ -76,10 +76,15 @@ pipeline:
 
 # ── 评估 ──
 evaluation:
-  use_cv: true                  # true = K 折 CV，记录 OOF / 折指标
-  cv_folds: 10                  # use_cv=true 时生效
-  test_size: 0.2                # use_cv=false 时 train/test 划分比例
+  use_cv: true                  # true = 启用 CV（小蛋白可由 adaptive_cv 降级为 hold-out）
+  cv_folds: 10                  # n ≥ adaptive_cv.mid_below 时使用的折数
+  test_size: 0.2                # hold-out 划分比例
   random_state: 42
+  adaptive_cv:                  # 按原子数分档（仅 use_cv=true 时生效）
+    enabled: true
+    holdout_below: 10           # n < 10  -> hold-out
+    mid_below: 25               # n < 25  -> cv_folds_mid 折；否则 cv_folds 折
+    cv_folds_mid: 5
 
 # ── 并行 ──
 parallel:

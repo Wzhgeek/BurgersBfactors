@@ -27,7 +27,6 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run import (
-    _eval_meta,
     _level_result_entry,
     _oof_pcc,
     _pick_best_regressor,
@@ -38,7 +37,16 @@ from run import (
 from src.features import extract_stats_features, load_aij_matrices
 from src.plot import plot_ux, plot_ut
 from src.regression import evaluate_regressor
-from src.utils import load_yaml, pcc_10digit, resolve_path, save_json, setup_logging
+from src.utils import (
+    evaluation_for_json,
+    format_eval_log,
+    load_yaml,
+    pcc_10digit,
+    resolve_evaluation,
+    resolve_path,
+    save_json,
+    setup_logging,
+)
 
 
 def parse_args():
@@ -113,6 +121,7 @@ def run_regression_phase(
     all_trj: dict,
     all_stats_features: dict,
     sim_time: int,
+    eval_json: dict,
     log: logging.Logger,
 ) -> int:
     """与 run.py 回归阶段逻辑一致，写出 all_score / result.json / figures。"""
@@ -290,8 +299,7 @@ def run_regression_phase(
         np.savetxt(all_score_dir / f"{pdb_id}_all_single_pcc_trj.csv", all_single_pcc_trj,
                    delimiter=",", header=header, comments="", fmt="%.10g")
     save_json({
-        "use_cv": use_cv,
-        "cv_folds": cv_folds,
+        **eval_json,
         "stats": fold_detail_stats,
         "trj": fold_detail_trj,
     }, all_score_dir / f"{pdb_id}_fold_detail.json")
@@ -308,12 +316,7 @@ def run_regression_phase(
         "eps_range": [eps_start, eps_stop, eps_step],
         "thresholds": [round(t, 1) for t in thresholds],
         "pipeline_mode": "regression_only",
-        "evaluation": {
-            "use_cv": use_cv,
-            "cv_folds": cv_folds,
-            "test_size": test_size,
-            "random_state": random_state,
-        },
+        "evaluation": eval_json,
         "simulation_time_s": int(sim_time),
         "regression_only": True,
         "rf_time_stats_s": round(rf_time_stats_total, 1),
@@ -394,7 +397,6 @@ def main():
     num_levels = graph_cfg["num_levels"]
     feat_cfg = cfg["features"]
     eval_cfg = cfg["evaluation"]
-    use_cv, cv_folds, test_size, random_state = _eval_meta(eval_cfg)
     reg_cfg = cfg["regressors"]
 
     step1_dir = step1_root / dataset
@@ -407,6 +409,14 @@ def main():
 
     labels = np.load(label_path).astype(np.float64)
     n_atoms = len(labels)
+
+    eval_res = resolve_evaluation(n_atoms, eval_cfg)
+    use_cv = eval_res["use_cv"]
+    cv_folds = eval_res["cv_folds"]
+    test_size = eval_res["test_size"]
+    random_state = eval_res["random_state"]
+    eval_json = evaluation_for_json(eval_res)
+    log.info(f"Evaluation: {format_eval_log(eval_res)} (n_atoms={n_atoms})")
 
     dist_path = step1_dir / pdb_id / "distance" / f"{pdb_id}_dist.npy"
     if not dist_path.exists():
@@ -472,6 +482,7 @@ def main():
         all_trj=all_trj,
         all_stats_features=all_stats_features,
         sim_time=int(sim_time),
+        eval_json=eval_json,
         log=log,
     )
 
