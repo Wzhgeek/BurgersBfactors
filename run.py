@@ -14,7 +14,6 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
@@ -39,6 +38,9 @@ def parse_args():
                    help="Epsilon for smoke test (default 0.5)")
     p.add_argument("--level", type=int, default=5,
                    help="Level for smoke test (default 5)")
+    p.add_argument("--mode", type=str, default=None,
+                   choices=["full", "sim_only", "regression_only"],
+                   help="Override config pipeline.mode")
     return p.parse_args()
 
 
@@ -72,45 +74,99 @@ def _save_model_csv(path: Path, model_grid: np.ndarray, header: str) -> None:
 
 
 def _oof_pcc(result: dict) -> float:
-    return float(result.get("oof_pcc", result["test_pcc"]))
+    return float(result.get("oof_pcc", result.get("test_pcc", 0)))
 
 
-def _level_result_entry(result: dict, model: str, eps_str: str) -> dict:
-    """构造 per_level / result.json 记录（同时含 OOF、最优折、折平均）。"""
+def _primary_score(result: dict, use_cv: bool) -> float:
+    if use_cv:
+        return _oof_pcc(result)
+    return float(result.get("single_pcc", result.get("test_pcc", 0)))
+
+
+def _level_result_entry(result: dict, model: str, eps_str: str, use_cv: bool) -> dict:
+    """构造 per_level / result.json 记录。"""
+    if use_cv:
+        return {
+            "eps": eps_str,
+            "oof_pcc": pcc_10digit(result.get("oof_pcc", result["test_pcc"])),
+            "best_fold_pcc": pcc_10digit(result.get("best_fold_pcc", result["test_pcc"])),
+            "mean_fold_pcc": pcc_10digit(result.get("mean_fold_pcc", result["test_pcc"])),
+            "best_fold": int(result.get("best_fold_idx", 1)),
+            "single_pcc": 0.0,
+            "model": model,
+            "fold_val_pccs": result.get("fold_val_pccs", []),
+        }
+    sp = float(result.get("single_pcc", result.get("test_pcc", 0)))
     return {
         "eps": eps_str,
-        "oof_pcc": pcc_10digit(result.get("oof_pcc", result["test_pcc"])),
-        "best_fold_pcc": pcc_10digit(result.get("best_fold_pcc", result["test_pcc"])),
-        "mean_fold_pcc": pcc_10digit(result.get("mean_fold_pcc", result["test_pcc"])),
-        "best_fold": int(result.get("best_fold_idx", 1)),
+        "oof_pcc": 0.0,
+        "best_fold_pcc": 0.0,
+        "mean_fold_pcc": 0.0,
+        "best_fold": 0,
+        "single_pcc": pcc_10digit(sp),
         "model": model,
-        "fold_val_pccs": result.get("fold_val_pccs", []),
+        "fold_val_pccs": [0.0],
     }
 
 
-def _pick_best_regressor(reg_cfg, X, labels, test_size, random_state, cv_folds):
-    """按 OOF PCC 选取最优回归器。"""
-    best_oof, best_model, best_result = -999.0, "RF", None
+def _pick_best_regressor(reg_cfg, X, labels, test_size, random_state, cv_folds, use_cv):
+    """按主指标（CV 用 OOF，hold-out 用 single_pcc）选取最优回归器。"""
+    best_score, best_model, best_result = -999.0, "RF", None
     for reg_name, reg_params in reg_cfg.items():
         if not reg_params.get("enabled", True):
             continue
-        r = evaluate_regressor(reg_name, X, labels, reg_params,
-                               test_size, random_state, cv_folds)
-        oof = _oof_pcc(r)
-        if oof > best_oof:
-            best_oof = oof
+        r = evaluate_regressor(
+            reg_name, X, labels, reg_params,
+            test_size, random_state, cv_folds, use_cv=use_cv)
+        score = _primary_score(r, use_cv)
+        if score > best_score:
+            best_score = score
             best_model = reg_name.upper()
             best_result = r
-    return best_oof, best_model, best_result
+    return best_score, best_model, best_result
 
 
-def _log_cv_metrics(prefix: str, r: dict, log) -> None:
-    log.info(
-        f"{prefix} OOF={r.get('oof_pcc', r['test_pcc']):.4f} "
-        f"best_fold={r.get('best_fold_idx', 1)}"
-        f"({r.get('best_fold_pcc', r['test_pcc']):.4f}) "
-        f"mean_fold={r.get('mean_fold_pcc', r['test_pcc']):.4f}"
-    )
+def _log_cv_metrics(prefix: str, r: dict, log, use_cv: bool) -> None:
+    if use_cv:
+        log.info(
+            f"{prefix} OOF={r.get('oof_pcc', r['test_pcc']):.4f} "
+            f"best_fold={r.get('best_fold_idx', 1)}"
+            f"({r.get('best_fold_pcc', r['test_pcc']):.4f}) "
+            f"mean_fold={r.get('mean_fold_pcc', r['test_pcc']):.4f}"
+        )
+    else:
+        log.info(f"{prefix} single_pcc={r.get('single_pcc', r['test_pcc']):.4f}")
+
+
+def load_saved_simulation(
+    traj_dir: Path,
+    pdb_id: str,
+    eps_list: np.ndarray,
+    num_levels: int,
+) -> tuple[dict, dict]:
+    """从 trajectory/*.npy 加载模拟结果。"""
+    all_trj = {}
+    all_stats_features = {}
+    for eps in eps_list:
+        eps_str = f"{eps:.1f}"
+        eps_tag = eps_str.replace(".", "-")
+        npy_path = traj_dir / f"{pdb_id}_dyn_trj_{eps_tag}.npy"
+        if not npy_path.exists():
+            raise FileNotFoundError(f"Missing trajectory file: {npy_path}")
+        trj_levels = np.load(npy_path)
+        for lvl in range(1, num_levels + 1):
+            trj = trj_levels[lvl - 1]
+            all_trj[(lvl, eps_str)] = trj
+            all_stats_features[(lvl, eps_str)] = extract_stats_features(trj)
+    return all_trj, all_stats_features
+
+
+def _eval_meta(eval_cfg: dict) -> tuple[bool, int, float, int]:
+    use_cv = bool(eval_cfg.get("use_cv", True))
+    test_size = float(eval_cfg.get("test_size", 0.2))
+    random_state = int(eval_cfg.get("random_state", 42))
+    cv_folds = int(eval_cfg.get("cv_folds", 10)) if use_cv else 0
+    return use_cv, cv_folds, test_size, random_state
 
 
 def main():
@@ -151,13 +207,17 @@ def main():
     n_pts = feat_cfg["trajectory"]["n_points"]
 
     eval_cfg = cfg["evaluation"]
-    test_size = eval_cfg["test_size"]
-    random_state = eval_cfg["random_state"]
-    cv_folds = eval_cfg.get("cv_folds", 10)
+    use_cv, cv_folds, test_size, random_state = _eval_meta(eval_cfg)
+    pipeline_cfg = cfg.get("pipeline", {})
+    mode = (args.mode or pipeline_cfg.get("mode", "full")).lower()
+    if mode not in ("full", "sim_only", "regression_only"):
+        log.error(f"Invalid pipeline.mode: {mode}")
+        return 1
 
     n_jobs = cfg["parallel"]["n_jobs"]
     if n_jobs <= 0:
-        n_jobs = cpu_count()
+        slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        n_jobs = int(slurm_cpus) if slurm_cpus else cpu_count()
 
     # ── 前置检查：step1 数据是否存在 ──
     aij_dir = step1_dir / pdb_id / "Aijandlabel"
@@ -183,9 +243,13 @@ def main():
         graph_cfg["percentile_start"], graph_cfg["percentile_stop"], num_levels)).tolist()
 
     log.info(f"Protein={pdb_id} dataset={dataset} atoms={n_atoms} levels={num_levels}")
+    log.info(f"Pipeline mode: {mode}")
     log.info(f"Eps range: [{eps_list[0]:.1f}, {eps_list[-1]:.1f}] n_jobs={n_jobs}")
     log.info(f"Thresholds: {[round(t,1) for t in thresholds]}")
-    log.info(f"Evaluation: {cv_folds}-fold CV" if cv_folds >= 2 else f"Evaluation: hold-out test_size={test_size}")
+    if use_cv:
+        log.info(f"Evaluation: {cv_folds}-fold CV")
+    else:
+        log.info(f"Evaluation: hold-out test_size={test_size} (single_pcc)")
 
     # ── 确定演化步数（基于 eps_ref, 中间层 L05） ──
     ref_lvl = min(5, num_levels)
@@ -224,27 +288,33 @@ def main():
 
         # Quick RF test (trj + stats)
         r_trj = evaluate_regressor("rf", trj_smoke, labels, cfg["regressors"].get("rf", {}),
-                                   test_size, random_state, cv_folds)
+                                   test_size, random_state, cv_folds, use_cv=use_cv)
         r_stats = evaluate_regressor("rf", stats_smoke, labels, cfg["regressors"].get("rf", {}),
-                                    test_size, random_state, cv_folds)
-        _log_cv_metrics("RF trj ", r_trj, log)
-        _log_cv_metrics("RF stats", r_stats, log)
+                                    test_size, random_state, cv_folds, use_cv=use_cv)
+        _log_cv_metrics("RF trj ", r_trj, log, use_cv)
+        _log_cv_metrics("RF stats", r_stats, log, use_cv)
 
         eps_str = f"{smoke_eps:.1f}"
         lvl_key = f"L{smoke_lvl:02d}"
-        per_trj = _level_result_entry(r_trj, "RF", eps_str)
-        per_stats = _level_result_entry(r_stats, "RF", eps_str)
+        per_trj = _level_result_entry(r_trj, "RF", eps_str, use_cv)
+        per_stats = _level_result_entry(r_stats, "RF", eps_str, use_cv)
         smoke_result = {
             "pdb_id": pdb_id,
             "dataset": dataset,
             "smoke": True,
+            "pipeline_mode": mode,
             "n_atoms": n_atoms,
             "n_steps": n_steps,
             "nu": nu,
             "dt": dt,
             "dx": dx,
             "smoke_config": {"level": smoke_lvl, "eps": smoke_eps},
-            "evaluation": {"cv_folds": cv_folds, "random_state": random_state},
+            "evaluation": {
+                "use_cv": use_cv,
+                "cv_folds": cv_folds,
+                "test_size": test_size,
+                "random_state": random_state,
+            },
             "best_combined_trj": {k: v for k, v in per_trj.items() if k != "fold_val_pccs"},
             "best_combined_stats": {k: v for k, v in per_stats.items() if k != "fold_val_pccs"},
             "per_level_trj": {lvl_key: per_trj},
@@ -275,50 +345,93 @@ def main():
     # ── 备份 config ──
     import shutil; shutil.copy(args.config, protein_out / "config.yaml")
 
-    # ── 并行模拟所有 (level, eps) ──
-    log.info(f"Starting simulation: {num_levels} levels × {len(eps_list)} eps")
-    t0 = time.time()
-    tasks = [(lvl, round(float(eps), 1), aij_matrices[lvl - 1], nu, dt, dx, n_steps, n_atoms, n_pts, coupling_mode)
-             for eps in eps_list for lvl in range(1, num_levels + 1)]
-
     all_trj = {}
     all_stats_features = {}
-    with Pool(n_jobs) as pool:
-        for i, (lvl, eps, trj, stats) in enumerate(pool.imap_unordered(simulate_one_task, tasks)):
+    sim_time = 0
+
+    if mode in ("full", "sim_only"):
+        # ── 并行模拟所有 (level, eps) ──
+        log.info(f"Starting simulation: {num_levels} levels × {len(eps_list)} eps")
+        t0 = time.time()
+        tasks = [(lvl, round(float(eps), 1), aij_matrices[lvl - 1], nu, dt, dx, n_steps, n_atoms, n_pts, coupling_mode)
+                 for eps in eps_list for lvl in range(1, num_levels + 1)]
+
+        with Pool(n_jobs) as pool:
+            for i, (lvl, eps, trj, stats) in enumerate(pool.imap_unordered(simulate_one_task, tasks)):
+                eps_str = f"{eps:.1f}"
+                key = (lvl, eps_str)
+                all_trj[key] = trj
+                all_stats_features[key] = stats
+                if (i + 1) % 100 == 0:
+                    pct = 100 * (i + 1) / len(tasks)
+                    log.info(f"Sim progress: {i+1}/{len(tasks)} ({pct:.0f}%) elapsed={time.time()-t0:.0f}s")
+        sim_time = time.time() - t0
+        log.info(f"Simulation done in {sim_time:.0f}s")
+
+        # ── 保存轨迹和特征 ──
+        log.info("Saving trajectories and features...")
+        for eps in eps_list:
             eps_str = f"{eps:.1f}"
-            key = (lvl, eps_str)
-            all_trj[key] = trj
-            all_stats_features[key] = stats
-            if (i + 1) % 100 == 0:
-                pct = 100 * (i + 1) / len(tasks)
-                log.info(f"Sim progress: {i+1}/{len(tasks)} ({pct:.0f}%) elapsed={time.time()-t0:.0f}s")
-    sim_time = time.time() - t0
-    log.info(f"Simulation done in {sim_time:.0f}s")
+            eps_tag = eps_str.replace(".", "-")
 
-    # ── 保存轨迹和特征 ──
-    log.info("Saving trajectories and features...")
-    for eps in eps_list:
-        eps_str = f"{eps:.1f}"
-        eps_tag = eps_str.replace(".", "-")
+            trj_levels = np.stack([all_trj[(lvl, eps_str)] for lvl in range(1, num_levels + 1)])
+            np.save(traj_dir / f"{pdb_id}_dyn_trj_{eps_tag}.npy", trj_levels)
 
-        # 轨迹: (10, n_pts, n_atoms) → 存为 (num_levels, n_atoms, n_pts) 或压平
-        trj_levels = np.stack([all_trj[(lvl, eps_str)] for lvl in range(1, num_levels + 1)])
-        np.save(traj_dir / f"{pdb_id}_dyn_trj_{eps_tag}.npy", trj_levels)
+            stats_levels = np.stack([all_stats_features[(lvl, eps_str)] for lvl in range(1, num_levels + 1)])
+            stats_2d = stats_levels.reshape(num_levels, -1)
+            cols = [f"L{lvl:02d}_{s}" for lvl in range(1, num_levels + 1)
+                    for s in feat_cfg["stats"]["names"]]
+            np.savetxt(feat_stats_dir / f"{pdb_id}_dyn_trj_feature_{eps_tag}.csv",
+                       stats_2d.T, delimiter=",", header=",".join(cols), comments="", fmt="%.10g")
 
-        # 统计量特征 CSV
-        stats_levels = np.stack([all_stats_features[(lvl, eps_str)] for lvl in range(1, num_levels + 1)])
-        # stats_levels: (10, n_atoms, 6)
-        stats_2d = stats_levels.reshape(num_levels, -1)
-        cols = [f"L{lvl:02d}_{s}" for lvl in range(1, num_levels + 1)
-                for s in feat_cfg["stats"]["names"]]
-        np.savetxt(feat_stats_dir / f"{pdb_id}_dyn_trj_feature_{eps_tag}.csv",
-                   stats_2d.T, delimiter=",", header=",".join(cols), comments="", fmt="%.10g")
+            trj_2d = trj_levels.reshape(num_levels, -1)
+            trj_cols = [f"L{lvl:02d}_t{t}" for lvl in range(1, num_levels + 1) for t in range(n_pts)]
+            np.savetxt(feat_trj_dir / f"{pdb_id}_dyn_trj_feature_{eps_tag}.csv",
+                       trj_2d.T, delimiter=",", header=",".join(trj_cols), comments="", fmt="%.10g")
 
-        # 采样轨迹特征 CSV
-        trj_2d = trj_levels.reshape(num_levels, -1)
-        trj_cols = [f"L{lvl:02d}_t{t}" for lvl in range(1, num_levels + 1) for t in range(n_pts)]
-        np.savetxt(feat_trj_dir / f"{pdb_id}_dyn_trj_feature_{eps_tag}.csv",
-                   trj_2d.T, delimiter=",", header=",".join(trj_cols), comments="", fmt="%.10g")
+    if mode == "sim_only":
+        sim_result = {
+            "pdb_id": pdb_id,
+            "dataset": dataset,
+            "pipeline_mode": "sim_only",
+            "n_atoms": n_atoms,
+            "n_steps": n_steps,
+            "nu": nu,
+            "dt": dt,
+            "dx": dx,
+            "eps_range": [eps_start, eps_stop, eps_step],
+            "thresholds": [round(t, 1) for t in thresholds],
+            "evaluation": {
+                "use_cv": use_cv,
+                "cv_folds": cv_folds,
+                "test_size": test_size,
+                "random_state": random_state,
+            },
+            "simulation_time_s": int(sim_time),
+        }
+        save_json(sim_result, protein_out / "result.json")
+        log.info(f"sim_only done. Trajectories saved: {traj_dir}")
+        return 0
+
+    if mode == "regression_only":
+        log.info(f"Loading saved trajectories from {traj_dir}")
+        try:
+            all_trj, all_stats_features = load_saved_simulation(
+                traj_dir, pdb_id, eps_list, num_levels)
+        except FileNotFoundError as e:
+            log.error(str(e))
+            log.error("Run with pipeline.mode=sim_only or full first.")
+            return 1
+        prev = protein_out / "result.json"
+        if prev.exists():
+            import json
+            with open(prev) as f:
+                prev_data = json.load(f)
+            sim_time = int(prev_data.get("simulation_time_s", 0))
+
+    if mode not in ("full", "regression_only"):
+        log.error(f"Unexpected pipeline mode: {mode}")
+        return 1
 
     # ── 回归评估 ──
     reg_cfg = cfg["regressors"]
@@ -333,6 +446,8 @@ def main():
     all_oof_trj = np.zeros((len(eps_list), num_levels))
     all_bestfold_pcc_trj = np.zeros((len(eps_list), num_levels))
     all_meanfold_trj = np.zeros((len(eps_list), num_levels))
+    all_single_pcc_stats = np.zeros((len(eps_list), num_levels))
+    all_single_pcc_trj = np.zeros((len(eps_list), num_levels))
     all_bestfold_trj = np.zeros((len(eps_list), num_levels), dtype=int)
     all_model_trj = np.empty((len(eps_list), num_levels), dtype=object)
     fold_detail_stats = {}
@@ -348,11 +463,13 @@ def main():
     best_per_level_stats = {}
     best_per_level_trj = {}
     for lvl in range(1, num_levels + 1):
-        best_per_level_stats[lvl] = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
-        best_per_level_trj[lvl] = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
+        best_per_level_stats[lvl] = {
+            "eps": 0, "oof_pcc": -999, "single_pcc": -999, "model": "RF", "best_fold": 1}
+        best_per_level_trj[lvl] = {
+            "eps": 0, "oof_pcc": -999, "single_pcc": -999, "model": "RF", "best_fold": 1}
 
-    best_combined_stats = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
-    best_combined_trj = {"eps": 0, "oof_pcc": -999, "model": "RF", "best_fold": 1}
+    best_combined_stats = {"eps": 0, "oof_pcc": -999, "single_pcc": -999, "model": "RF", "best_fold": 1}
+    best_combined_trj = {"eps": 0, "oof_pcc": -999, "single_pcc": -999, "model": "RF", "best_fold": 1}
 
     # results for all regressors
     all_reg_results = {}
@@ -372,7 +489,7 @@ def main():
                 if not reg_params.get("enabled", True):
                     continue
                 result = evaluate_regressor(reg_name, X_s, labels, reg_params,
-                                           test_size, random_state, cv_folds)
+                                           test_size, random_state, cv_folds, use_cv=use_cv)
                 key = f"{reg_name}_stats_eps{eps_str}"
                 all_reg_results[key] = result
             rf_time_stats_total += time.time() - t1
@@ -385,9 +502,9 @@ def main():
                 if key not in all_reg_results:
                     continue
                 r = all_reg_results[key]
-                oof = _oof_pcc(r)
-                if oof > best_combined_stats["oof_pcc"]:
-                    best_combined_stats = _level_result_entry(r, reg_name.upper(), eps_str)
+                score = _primary_score(r, use_cv)
+                if score > _primary_score(best_combined_stats, use_cv):
+                    best_combined_stats = _level_result_entry(r, reg_name.upper(), eps_str, use_cv)
 
         if feat_cfg["trajectory"]["enabled"]:
             t1 = time.time()
@@ -397,7 +514,7 @@ def main():
                 if not reg_params.get("enabled", True):
                     continue
                 result = evaluate_regressor(reg_name, X_t, labels, reg_params,
-                                           test_size, random_state, cv_folds)
+                                           test_size, random_state, cv_folds, use_cv=use_cv)
                 key = f"{reg_name}_trj_eps{eps_str}"
                 all_reg_results[key] = result
             rf_time_trj_total += time.time() - t1
@@ -409,9 +526,9 @@ def main():
                 if key not in all_reg_results:
                     continue
                 r = all_reg_results[key]
-                oof = _oof_pcc(r)
-                if oof > best_combined_trj["oof_pcc"]:
-                    best_combined_trj = _level_result_entry(r, reg_name.upper(), eps_str)
+                score = _primary_score(r, use_cv)
+                if score > _primary_score(best_combined_trj, use_cv):
+                    best_combined_trj = _level_result_entry(r, reg_name.upper(), eps_str, use_cv)
 
         # ── Per-level ──
         for lvl in range(1, num_levels + 1):
@@ -419,58 +536,77 @@ def main():
             if feat_cfg["stats"]["enabled"]:
                 s = all_stats_features[(lvl, eps_str)]
                 _, best_cell_model, best_r = _pick_best_regressor(
-                    reg_cfg, s, labels, test_size, random_state, cv_folds)
+                    reg_cfg, s, labels, test_size, random_state, cv_folds, use_cv)
                 if best_r is None:
                     continue
-                all_oof_stats[ei, lvl - 1] = pcc_10digit(_oof_pcc(best_r))
-                all_bestfold_pcc_stats[ei, lvl - 1] = pcc_10digit(best_r.get("best_fold_pcc", best_r["test_pcc"]))
-                all_meanfold_stats[ei, lvl - 1] = pcc_10digit(best_r.get("mean_fold_pcc", best_r["test_pcc"]))
-                all_bestfold_stats[ei, lvl - 1] = int(best_r.get("best_fold_idx", 1))
+                if use_cv:
+                    all_oof_stats[ei, lvl - 1] = pcc_10digit(_oof_pcc(best_r))
+                    all_bestfold_pcc_stats[ei, lvl - 1] = pcc_10digit(
+                        best_r.get("best_fold_pcc", best_r["test_pcc"]))
+                    all_meanfold_stats[ei, lvl - 1] = pcc_10digit(
+                        best_r.get("mean_fold_pcc", best_r["test_pcc"]))
+                    all_bestfold_stats[ei, lvl - 1] = int(best_r.get("best_fold_idx", 1))
+                else:
+                    all_single_pcc_stats[ei, lvl - 1] = pcc_10digit(_primary_score(best_r, use_cv))
                 all_model_stats[ei, lvl - 1] = best_cell_model
                 fold_detail_stats.setdefault(eps_str, {})[f"L{lvl:02d}"] = {
                     "model": best_cell_model,
-                    "oof_pcc": best_r.get("oof_pcc", best_r["test_pcc"]),
-                    "best_fold_pcc": best_r.get("best_fold_pcc", best_r["test_pcc"]),
-                    "mean_fold_pcc": best_r.get("mean_fold_pcc", best_r["test_pcc"]),
-                    "best_fold": int(best_r.get("best_fold_idx", 1)),
+                    "oof_pcc": best_r.get("oof_pcc", 0) if use_cv else 0,
+                    "best_fold_pcc": best_r.get("best_fold_pcc", 0) if use_cv else 0,
+                    "mean_fold_pcc": best_r.get("mean_fold_pcc", 0) if use_cv else 0,
+                    "single_pcc": best_r.get("single_pcc", 0) if not use_cv else 0,
+                    "best_fold": int(best_r.get("best_fold_idx", 0)),
                     "fold_val_pccs": best_r.get("fold_val_pccs", []),
                 }
-                entry = _level_result_entry(best_r, best_cell_model, eps_str)
-                if _oof_pcc(best_r) > best_per_level_stats[lvl]["oof_pcc"]:
+                entry = _level_result_entry(best_r, best_cell_model, eps_str, use_cv)
+                if _primary_score(best_r, use_cv) > _primary_score(best_per_level_stats[lvl], use_cv):
                     best_per_level_stats[lvl] = entry
 
             if feat_cfg["trajectory"]["enabled"]:
                 t = all_trj[(lvl, eps_str)]
                 _, best_cell_model, best_r = _pick_best_regressor(
-                    reg_cfg, t, labels, test_size, random_state, cv_folds)
+                    reg_cfg, t, labels, test_size, random_state, cv_folds, use_cv)
                 if best_r is None:
                     continue
-                all_oof_trj[ei, lvl - 1] = pcc_10digit(_oof_pcc(best_r))
-                all_bestfold_pcc_trj[ei, lvl - 1] = pcc_10digit(best_r.get("best_fold_pcc", best_r["test_pcc"]))
-                all_meanfold_trj[ei, lvl - 1] = pcc_10digit(best_r.get("mean_fold_pcc", best_r["test_pcc"]))
-                all_bestfold_trj[ei, lvl - 1] = int(best_r.get("best_fold_idx", 1))
+                if use_cv:
+                    all_oof_trj[ei, lvl - 1] = pcc_10digit(_oof_pcc(best_r))
+                    all_bestfold_pcc_trj[ei, lvl - 1] = pcc_10digit(
+                        best_r.get("best_fold_pcc", best_r["test_pcc"]))
+                    all_meanfold_trj[ei, lvl - 1] = pcc_10digit(
+                        best_r.get("mean_fold_pcc", best_r["test_pcc"]))
+                    all_bestfold_trj[ei, lvl - 1] = int(best_r.get("best_fold_idx", 1))
+                else:
+                    all_single_pcc_trj[ei, lvl - 1] = pcc_10digit(_primary_score(best_r, use_cv))
                 all_model_trj[ei, lvl - 1] = best_cell_model
                 fold_detail_trj.setdefault(eps_str, {})[f"L{lvl:02d}"] = {
                     "model": best_cell_model,
-                    "oof_pcc": best_r.get("oof_pcc", best_r["test_pcc"]),
-                    "best_fold_pcc": best_r.get("best_fold_pcc", best_r["test_pcc"]),
-                    "mean_fold_pcc": best_r.get("mean_fold_pcc", best_r["test_pcc"]),
-                    "best_fold": int(best_r.get("best_fold_idx", 1)),
+                    "oof_pcc": best_r.get("oof_pcc", 0) if use_cv else 0,
+                    "best_fold_pcc": best_r.get("best_fold_pcc", 0) if use_cv else 0,
+                    "mean_fold_pcc": best_r.get("mean_fold_pcc", 0) if use_cv else 0,
+                    "single_pcc": best_r.get("single_pcc", 0) if not use_cv else 0,
+                    "best_fold": int(best_r.get("best_fold_idx", 0)),
                     "fold_val_pccs": best_r.get("fold_val_pccs", []),
                 }
-                entry = _level_result_entry(best_r, best_cell_model, eps_str)
-                if _oof_pcc(best_r) > best_per_level_trj[lvl]["oof_pcc"]:
+                entry = _level_result_entry(best_r, best_cell_model, eps_str, use_cv)
+                if _primary_score(best_r, use_cv) > _primary_score(best_per_level_trj[lvl], use_cv):
                     best_per_level_trj[lvl] = entry
 
         lvl6 = best_per_level_stats.get(6, {})
-        log.info(
-            f"eps={eps_str} done: stats "
-            f"OOF={lvl6.get('oof_pcc', 0):.4f} "
-            f"best_fold={lvl6.get('best_fold', 1)}"
-            f"({lvl6.get('best_fold_pcc', 0):.4f}) "
-            f"mean_fold={lvl6.get('mean_fold_pcc', 0):.4f} "
-            f"model={lvl6.get('model', 'RF')}"
-        )
+        if use_cv:
+            log.info(
+                f"eps={eps_str} done: stats "
+                f"OOF={lvl6.get('oof_pcc', 0):.4f} "
+                f"best_fold={lvl6.get('best_fold', 1)}"
+                f"({lvl6.get('best_fold_pcc', 0):.4f}) "
+                f"mean_fold={lvl6.get('mean_fold_pcc', 0):.4f} "
+                f"model={lvl6.get('model', 'RF')}"
+            )
+        else:
+            log.info(
+                f"eps={eps_str} done: stats "
+                f"single_pcc={lvl6.get('single_pcc', 0):.4f} "
+                f"model={lvl6.get('model', 'RF')}"
+            )
 
     # ── 保存 OOF / 最优折 / 折平均 / 折号 / 模型 CSV ──
     header = ",".join([f"L{lvl:02d}" for lvl in range(1, num_levels + 1)])
@@ -492,7 +628,13 @@ def main():
                delimiter=",", header=header, comments="", fmt="%d")
     _save_model_csv(all_score_dir / f"{pdb_id}_all_model_stats.csv", all_model_stats, header)
     _save_model_csv(all_score_dir / f"{pdb_id}_all_model_trj.csv", all_model_trj, header)
+    if not use_cv:
+        np.savetxt(all_score_dir / f"{pdb_id}_all_single_pcc_stats.csv", all_single_pcc_stats,
+                   delimiter=",", header=header, comments="", fmt="%.10g")
+        np.savetxt(all_score_dir / f"{pdb_id}_all_single_pcc_trj.csv", all_single_pcc_trj,
+                   delimiter=",", header=header, comments="", fmt="%.10g")
     save_json({
+        "use_cv": use_cv,
         "cv_folds": cv_folds,
         "stats": fold_detail_stats,
         "trj": fold_detail_trj,
@@ -502,10 +644,16 @@ def main():
     # ── 保存 result.json ──
     result = {
         "pdb_id": pdb_id, "dataset": dataset, "n_atoms": n_atoms,
+        "pipeline_mode": mode,
         "n_steps": n_steps, "nu": nu, "dt": dt, "dx": dx,
         "eps_range": [eps_start, eps_stop, eps_step],
         "thresholds": [round(t, 1) for t in thresholds],
-        "evaluation": {"cv_folds": cv_folds, "random_state": random_state},
+        "evaluation": {
+            "use_cv": use_cv,
+            "cv_folds": cv_folds,
+            "test_size": test_size,
+            "random_state": random_state,
+        },
         "simulation_time_s": int(sim_time),
         "rf_time_stats_s": round(rf_time_stats_total, 1),
         "rf_time_trj_s": round(rf_time_trj_total, 1),
@@ -519,8 +667,10 @@ def main():
     # ── 绘图（最优 eps, 统计量特征的最佳层） ──
     best_eps_str = best_combined_stats["eps"]
     best_eps = float(best_eps_str)
-    best_lvl = max(range(1, num_levels + 1),
-                   key=lambda l: best_per_level_stats[l].get("oof_pcc", -999))
+    best_lvl = max(
+        range(1, num_levels + 1),
+        key=lambda l: _primary_score(best_per_level_stats[l], use_cv),
+    )
     best_plot_model = best_per_level_stats[best_lvl].get("model", "RF")
     best_ei = next((i for i, e in enumerate(eps_list) if f"{e:.1f}" == best_eps_str), 0)
     if feat_cfg["stats"]["enabled"]:
@@ -542,18 +692,28 @@ def main():
 
     bc = best_combined_stats
     bt = best_combined_trj
-    log.info(
-        f"Done. Best stats: OOF={bc.get('oof_pcc', 0):.4f} "
-        f"best_fold={bc.get('best_fold', 1)}({bc.get('best_fold_pcc', 0):.4f}) "
-        f"mean_fold={bc.get('mean_fold_pcc', 0):.4f} "
-        f"eps={bc.get('eps')} model={bc.get('model', 'RF')}"
-    )
-    log.info(
-        f"Best trj: OOF={bt.get('oof_pcc', 0):.4f} "
-        f"best_fold={bt.get('best_fold', 1)}({bt.get('best_fold_pcc', 0):.4f}) "
-        f"mean_fold={bt.get('mean_fold_pcc', 0):.4f} "
-        f"eps={bt.get('eps')} model={bt.get('model', 'RF')}"
-    )
+    if use_cv:
+        log.info(
+            f"Done. Best stats: OOF={bc.get('oof_pcc', 0):.4f} "
+            f"best_fold={bc.get('best_fold', 1)}({bc.get('best_fold_pcc', 0):.4f}) "
+            f"mean_fold={bc.get('mean_fold_pcc', 0):.4f} "
+            f"eps={bc.get('eps')} model={bc.get('model', 'RF')}"
+        )
+        log.info(
+            f"Best trj: OOF={bt.get('oof_pcc', 0):.4f} "
+            f"best_fold={bt.get('best_fold', 1)}({bt.get('best_fold_pcc', 0):.4f}) "
+            f"mean_fold={bt.get('mean_fold_pcc', 0):.4f} "
+            f"eps={bt.get('eps')} model={bt.get('model', 'RF')}"
+        )
+    else:
+        log.info(
+            f"Done. Best stats: single_pcc={bc.get('single_pcc', 0):.4f} "
+            f"eps={bc.get('eps')} model={bc.get('model', 'RF')}"
+        )
+        log.info(
+            f"Best trj: single_pcc={bt.get('single_pcc', 0):.4f} "
+            f"eps={bt.get('eps')} model={bt.get('model', 'RF')}"
+        )
     log.info(f"Result saved: {protein_out / 'result.json'}")
     log.info(f"Result dir: {protein_out}")
     return 0

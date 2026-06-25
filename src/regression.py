@@ -134,7 +134,7 @@ def _fit_and_predict_pair(
 
     if name == "KNN":
         model = KNeighborsRegressor(
-            n_neighbors=params.get("n_neighbors", 5),
+            n_neighbors=_effective_knn_neighbors(params, len(y_train)),
             weights=params.get("weights", "uniform"),
             n_jobs=params.get("n_jobs", 1),
         )
@@ -190,6 +190,12 @@ def _fit_and_predict_pair(
     )
 
 
+def _effective_knn_neighbors(params: dict, n_samples_fit: int) -> int:
+    """KNN 邻居数不超过训练样本数（极小蛋白 + 多折 CV 时需要）。"""
+    k = int(params.get("n_neighbors", 5))
+    return max(1, min(k, n_samples_fit))
+
+
 def _fit_and_predict(
     name: str,
     X_train: np.ndarray,
@@ -213,7 +219,7 @@ def _fit_and_predict(
 
     if name == "KNN":
         model = KNeighborsRegressor(
-            n_neighbors=params.get("n_neighbors", 5),
+            n_neighbors=_effective_knn_neighbors(params, len(y_train)),
             weights=params.get("weights", "uniform"),
             n_jobs=params.get("n_jobs", 1),
         )
@@ -268,6 +274,8 @@ def _evaluate_holdout(
     params: dict,
     test_size: float,
     random_state: int,
+    *,
+    as_single: bool = False,
 ) -> dict:
     """单次 train/test 划分评估。"""
     scaler = StandardScaler()
@@ -284,11 +292,33 @@ def _evaluate_holdout(
     train_pcc, train_rmse, train_r2 = _compute_metrics(y_train, train_pred)
     test_pcc, test_rmse, test_r2 = _compute_metrics(y_test, test_pred)
 
+    if as_single:
+        sp = _pcc_10digit(test_pcc)
+        return {
+            "cv_mode": "holdout",
+            "cv_folds": 0,
+            "train_pcc": train_pcc,
+            "test_pcc": test_pcc,
+            "single_pcc": sp,
+            "oof_pcc": 0.0,
+            "best_fold_pcc": 0.0,
+            "best_fold_idx": 0,
+            "mean_fold_pcc": 0.0,
+            "test_pcc_std": 0.0,
+            "fold_val_pccs": [0.0],
+            "train_rmse": train_rmse,
+            "test_rmse": test_rmse,
+            "train_r2": train_r2,
+            "test_r2": test_r2,
+            "time_s": float(elapsed),
+        }
+
     return {
         "cv_mode": "holdout",
         "cv_folds": 1,
         "train_pcc": train_pcc,
         "test_pcc": test_pcc,
+        "single_pcc": _pcc_10digit(test_pcc),
         "oof_pcc": test_pcc,
         "best_fold_pcc": test_pcc,
         "best_fold_idx": 1,
@@ -353,6 +383,7 @@ def _evaluate_kfold(
         "cv_folds": n_splits,
         "train_pcc": _pcc_10digit(train_pcc),
         "test_pcc": test_pcc,
+        "single_pcc": 0.0,
         "oof_pcc": test_pcc,
         "best_fold_pcc": _pcc_10digit(best_fold_pcc),
         "best_fold_idx": best_fold_idx,
@@ -377,22 +408,28 @@ def evaluate_regressor(
     test_size: float = 0.2,
     random_state: int = 42,
     cv_folds: int = 10,
+    use_cv: bool | None = None,
 ) -> dict:
     """
     训练并评估一个回归器。
 
-    cv_folds >= 2 时使用 K 折交叉验证（每折内单独标准化特征）；
-    test_pcc / oof_pcc 为全部 OOF 预测对真实标签的整体 PCC。
+    use_cv=True：K 折交叉验证，single_pcc=0，记录 oof/best_fold/mean_fold。
+    use_cv=False：单次 train/test，single_pcc 有效，CV 相关指标填 0。
 
     Returns
     -------
     dict
-        oof_pcc, best_fold_pcc, best_fold_idx, mean_fold_pcc, fold_val_pccs,
-        train_pcc, test_pcc, test_pcc_std, cv_mode, cv_folds, ...
+        single_pcc, oof_pcc, best_fold_pcc, best_fold_idx, mean_fold_pcc, ...
     """
     if params is None:
         params = {}
 
-    if cv_folds >= 2:
-        return _evaluate_kfold(name, X, y, params, cv_folds, random_state)
-    return _evaluate_holdout(name, X, y, params, test_size, random_state)
+    if use_cv is None:
+        use_cv = cv_folds >= 2
+
+    if use_cv:
+        folds = cv_folds if cv_folds >= 2 else 10
+        return _evaluate_kfold(name, X, y, params, folds, random_state)
+
+    return _evaluate_holdout(
+        name, X, y, params, test_size, random_state, as_single=True)

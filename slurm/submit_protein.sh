@@ -2,9 +2,9 @@
 # Author: Zihan Wang
 # <wangzh011031@163.com>
 #SBATCH --partition=general-long
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=3-00:00:00
 
 # 兼容旧用法；推荐使用: bash slurm/pcode_job.sh submit <dataset> <protein>
 # Usage: sbatch --job-name=pcode_33small_1Q9B submit_protein.sh 33small 1Q9B
@@ -22,7 +22,8 @@ if [ -z "$SLURM_JOB_NAME" ] || [ "$SLURM_JOB_NAME" = "submit_protein.sh" ]; then
     scontrol update job=$SLURM_JOB_ID name="${DATASET}_${PROTEIN}" 2>/dev/null || true
 fi
 
-LOGDIR="logs"
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-/mnt/home/jiangj33/Pcode}"
+LOGDIR="${PROJECT_DIR}/slurm/logs"
 mkdir -p "$LOGDIR"
 
 exec > >(tee -a "${LOGDIR}/${DATASET}_${PROTEIN}_${SLURM_JOB_ID}.out") 2>&1
@@ -36,8 +37,7 @@ echo "CPUs:      ${SLURM_CPUS_PER_TASK}"
 echo "Node:      $(hostname)"
 echo "========================================="
 
-# cd to Pcode/ (parent of slurm/)
-cd "$(dirname "$0")/.." || exit 1
+cd "$PROJECT_DIR" || exit 1
 echo "Working dir: $(pwd)"
 
 CONDA_SH="/mnt/home/jiangj33/anaconda3/etc/profile.d/conda.sh"

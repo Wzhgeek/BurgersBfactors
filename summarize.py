@@ -30,6 +30,62 @@ def parse_args():
     return p.parse_args()
 
 
+def _infer_use_cv(eval_info: dict) -> bool:
+    if "use_cv" in eval_info:
+        return bool(eval_info["use_cv"])
+    return int(eval_info.get("cv_folds", 10)) >= 2
+
+
+def _entry_score(info: dict, use_cv: bool) -> float:
+    if isinstance(info, dict):
+        if use_cv:
+            return float(info.get("oof_pcc", info.get("pcc", -999)))
+        return float(info.get("single_pcc", 0))
+    if isinstance(info, (int, float)):
+        return float(info)
+    return -999.0
+
+
+def _best_row(pdb: str, per_level: dict, runtime, eval_info: dict) -> dict:
+    """从 per_level_* 中按主指标选全局最优，同时输出 OOF / 折 / single 指标。"""
+    use_cv = _infer_use_cv(eval_info)
+    best_lvl, best_eps, best_model = "", "", "RF"
+    best_oof, best_fold, best_fold_pcc, best_mean, best_single = 0, 0, 0, 0, 0
+    best_score = -999.0
+
+    for lvl_key, info in per_level.items():
+        if not isinstance(info, dict):
+            if isinstance(info, (int, float)) and use_cv and float(info) > best_score:
+                best_score = float(info)
+                best_oof = float(info)
+                best_lvl = lvl_key
+            continue
+        score = _entry_score(info, use_cv)
+        if score > best_score:
+            best_score = score
+            best_lvl = lvl_key
+            best_eps = info.get("eps", "")
+            best_model = info.get("model", "RF")
+            best_oof = float(info.get("oof_pcc", info.get("pcc", 0)))
+            best_single = float(info.get("single_pcc", 0))
+            best_fold = int(info.get("best_fold", 0))
+            best_fold_pcc = float(info.get("best_fold_pcc", 0))
+            best_mean = float(info.get("mean_fold_pcc", 0))
+
+    return {
+        "Protein": pdb,
+        "Level": best_lvl,
+        "Epsilon": best_eps,
+        "OOF_PCC": round(best_oof, 4) if use_cv else 0.0,
+        "BestFold": best_fold,
+        "BestFold_PCC": round(best_fold_pcc, 4) if use_cv else 0.0,
+        "MeanFold_PCC": round(best_mean, 4) if use_cv else 0.0,
+        "Single_PCC": round(best_single, 4) if not use_cv else 0.0,
+        "Runtime": runtime,
+        "Model": best_model,
+    }
+
+
 def _best_row(pdb: str, per_level: dict, runtime) -> dict:
     """从 per_level_* 中按 OOF 选全局最优，同时输出三种 PCC。"""
     best_lvl, best_eps, best_model = "", "", "RF"
@@ -68,9 +124,12 @@ def summarize_dataset(dataset: str, result_root: Path, output_dir: Path = None):
 
     if output_dir is None:
         output_dir = result_base
+    else:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    rows_stats = []  # for stats features
-    rows_trj = []    # for trajectory features
+    rows_stats = []
+    rows_trj = []
 
     for protein_dir in sorted(result_base.iterdir()):
         if not protein_dir.is_dir():
@@ -84,23 +143,28 @@ def summarize_dataset(dataset: str, result_root: Path, output_dir: Path = None):
         with open(result_path) as f:
             data = json.load(f)
 
+        if data.get("pipeline_mode") == "sim_only":
+            print(f"  SKIP {pdb}: sim_only (no regression results)")
+            continue
+
         sim_time = data.get("simulation_time_s", 0)
+        eval_info = data.get("evaluation", {})
 
         rows_stats.append(_best_row(
             pdb, data.get("per_level_stats", {}),
             data.get("rf_time_stats_s", sim_time),
+            eval_info,
         ))
 
         rows_trj.append(_best_row(
             pdb, data.get("per_level_trj", {}),
             data.get("rf_time_trj_s", sim_time),
+            eval_info,
         ))
 
-    # Write CSV for stats features
     if rows_stats:
         write_csv(output_dir / f"{dataset}_result_stats.csv", rows_stats)
 
-    # Write CSV for trajectory features
     if rows_trj:
         write_csv(output_dir / f"{dataset}_result_trj.csv", rows_trj)
 
@@ -118,10 +182,12 @@ def write_csv(path: Path, rows: list[dict]):
     oof_vals = [r["OOF_PCC"] for r in rows if isinstance(r.get("OOF_PCC"), (int, float))]
     bf_vals = [r["BestFold_PCC"] for r in rows if isinstance(r.get("BestFold_PCC"), (int, float))]
     mf_vals = [r["MeanFold_PCC"] for r in rows if isinstance(r.get("MeanFold_PCC"), (int, float))]
+    sp_vals = [r["Single_PCC"] for r in rows if isinstance(r.get("Single_PCC"), (int, float))]
     rt_vals = [r["Runtime"] for r in rows if isinstance(r.get("Runtime"), (int, float))]
     avg_oof = np.mean(oof_vals) if oof_vals else 0
     avg_bf = np.mean(bf_vals) if bf_vals else 0
     avg_mf = np.mean(mf_vals) if mf_vals else 0
+    avg_sp = np.mean([v for v in sp_vals if v > 0]) if any(v > 0 for v in sp_vals) else 0
     avg_rt = np.mean(rt_vals) if rt_vals else 0
 
     for row in rows:
@@ -132,6 +198,7 @@ def write_csv(path: Path, rows: list[dict]):
     avg_row["OOF_PCC"] = f"{avg_oof:.4f}"
     avg_row["BestFold_PCC"] = f"{avg_bf:.4f}"
     avg_row["MeanFold_PCC"] = f"{avg_mf:.4f}"
+    avg_row["Single_PCC"] = f"{avg_sp:.4f}"
     avg_row["Runtime"] = f"{avg_rt:.1f}"
     lines.append(",".join(str(avg_row[k]) for k in keys))
 

@@ -47,7 +47,7 @@ for ds in "${DATASETS[@]}"; do
         sbatch --partition="${PCODE_PARTITION:-general-long}" \
                --cpus-per-task="${PCODE_CPUS:-16}" \
                --mem="${PCODE_MEM:-32G}" \
-               --time="${PCODE_TIME:-12:00:00}" \
+               --time="${PCODE_TIME:-3-00:00:00}" \
                --job-name="pcode_${ds}_${protein}" \
                --output="${LOGDIR}/${ds}_${protein}_%j.out" \
                "${SCRIPT_DIR}/run_worker.sh" "$ds" "$protein"

@@ -70,15 +70,20 @@ regressors:
     epochs: 300
     lr: 0.002
 
+# ── 流水线 ──
+pipeline:
+  mode: regression_only         # full | sim_only | regression_only
+
 # ── 评估 ──
 evaluation:
-  cv_folds: 10                 # >=2 启用 K 折交叉验证；<2 回退 hold-out
-  test_size: 0.2                # 仅 hold-out 模式使用
+  use_cv: true                  # true = K 折 CV，记录 OOF / 折指标
+  cv_folds: 10                  # use_cv=true 时生效
+  test_size: 0.2                # use_cv=false 时 train/test 划分比例
   random_state: 42
 
 # ── 并行 ──
 parallel:
-  n_jobs: -1                   # -1 = all cores
+  n_jobs: -1                   # -1 = SLURM_CPUS_PER_TASK（本地则 cpu_count）
 
 # ── 日志 ──
 logging:

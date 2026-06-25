@@ -16,6 +16,7 @@ venv/
 result/
 logs/
 docs/
+docs/
 
 # IDE
 .idea/
