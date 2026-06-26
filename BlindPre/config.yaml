@@ -1,6 +1,6 @@
 # Author: Zihan Wang
 # <wangzh011031@163.com>
-# BlindPre LOO 盲测配置（与 B-factor 保持一致）
+# BlindPre LOO 盲测配置
 
 # ── 数据集 ──
 datasets:
@@ -8,17 +8,21 @@ datasets:
   - 35large
   - 36med
 
-# ── 排除蛋白（与 B-factor small 对齐） ──
-exclude:
-  33small:
-    - 1OB4
-    - 1OB7
-    - 2OLX
+# ── 排除蛋白 ──
+exclude: {}
 
 # ── 路径 ──
 paths:
   exp_res: /Volumes/CodeandDataset/ProNAB/BfactorBT/EXP_RES
   code_data: /Volumes/CodeandDataset/ProNAB/BfactorBT/code_data
+
+preprocessing:
+  scale: true
+
+# ── 网格搜索（GroupKFold 按蛋白分组） ──
+grid_search:
+  enabled: true
+  cv_folds: 3
 
 # ── 模型 ──
 models:
@@ -30,12 +34,21 @@ models:
     learning_rate: 0.002
     subsample: 0.8
     max_features: sqrt
+    param_grid:
+      n_estimators: [500, 1000]
+      max_depth: [5, 7, 10]
+      learning_rate: [0.001, 0.002, 0.005]
+      subsample: [0.6, 0.8, 1.0]
   RF:
     enabled: true
     n_estimators: 1000
     max_depth: 8
     min_samples_split: 4
     min_samples_leaf: 2
+    param_grid:
+      n_estimators: [500, 1000]
+      max_depth: [5, 8, 15]
+      min_samples_leaf: [1, 2, 4]
 
 # ── 评估 ──
 evaluation:

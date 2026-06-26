@@ -4,7 +4,7 @@
 
 特征: 100 ε × 10 level × 6 stat = 6000 维/原子
 标签: B-factor (来自 .xyzb 文件)
-模型: GBDT + RF, 无 StandardScaler, 默认参数
+模型: GBDT + RF, 与 B-factor 盲测一致
 
 用法:
     python blind_loo.py
@@ -12,6 +12,7 @@
 """
 
 import argparse
+import itertools
 import re
 import time
 from pathlib import Path
@@ -20,6 +21,8 @@ import numpy as np
 import yaml
 from scipy.stats import pearsonr
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.model_selection import GroupKFold
+from sklearn.preprocessing import StandardScaler
 
 
 def load_yaml(path: Path) -> dict:
@@ -127,8 +130,53 @@ def build_model(model_name: str, cfg: dict, rs: int):
         )
 
 
+def grid_search_best_params(data: dict, model_name: str,
+                            model_cfg: dict, grid_cfg: dict,
+                            use_scale: bool, rs: int) -> dict:
+    """3-fold GroupKFold 网格搜索最优参数。"""
+    param_grid = model_cfg.get("param_grid", {})
+    if not param_grid:
+        return model_cfg
+
+    pdb_ids = sorted(data.keys())
+    X_all = np.vstack([data[p][0] for p in pdb_ids])
+    y_all = np.concatenate([data[p][1] for p in pdb_ids])
+    groups = np.concatenate([np.full(data[p][0].shape[0], i)
+                             for i, p in enumerate(pdb_ids)])
+
+    if use_scale:
+        X_all = StandardScaler().fit_transform(X_all)
+
+    cv = GroupKFold(n_splits=grid_cfg.get("cv_folds", 3))
+    keys, values = list(param_grid.keys()), list(param_grid.values())
+    combos = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+    print(f"\n[{model_name}] Grid Search ({len(combos)} combos × "
+          f"{grid_cfg['cv_folds']} folds):")
+
+    best_pcc, best_params = -999, None
+    for params in combos:
+        fold_pccs = []
+        for train_idx, val_idx in cv.split(X_all, y_all, groups):
+            merged = {**model_cfg, **params}
+            model = build_model(model_name, merged, rs)
+            model.fit(X_all[train_idx], y_all[train_idx])
+            y_pred = model.predict(X_all[val_idx])
+            fold_pccs.append(pearsonr(y_pred, y_all[val_idx])[0])
+
+        mean_pcc = np.mean(fold_pccs)
+        if mean_pcc > best_pcc:
+            best_pcc = mean_pcc
+            best_params = dict(params)
+
+    merged = {**model_cfg, **best_params}
+    print(f"  最优: {best_params}  PCC={best_pcc:.4f}")
+    return merged
+
+
 def loo_evaluate(data: dict, dataset: str, model_name: str,
-                 model_cfg: dict, output_dir: Path, rs: int) -> dict:
+                 model_cfg: dict, output_dir: Path, rs: int,
+                 use_scale: bool) -> dict:
     pdb_ids = sorted(data.keys())
     n = len(pdb_ids)
 
@@ -143,6 +191,11 @@ def loo_evaluate(data: dict, dataset: str, model_name: str,
         X_test, y_test = data[test_pdb]
         X_train = np.vstack([data[p][0] for p in pdb_ids if p != test_pdb])
         y_train = np.concatenate([data[p][1] for p in pdb_ids if p != test_pdb])
+
+        if use_scale:
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
 
         model = build_model(model_name, model_cfg, rs)
         model.fit(X_train, y_train)
@@ -165,6 +218,10 @@ def loo_evaluate(data: dict, dataset: str, model_name: str,
     pccs = [r["pcc"] for r in results]
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / "best_params.txt", "w") as f:
+        for k, v in model_cfg.items():
+            if k not in ("param_grid", "enabled"):
+                f.write(f"{k}: {v}\n")
     with open(output_dir / "per_protein.csv", "w") as f:
         f.write("pdb_id,n_atoms,pcc,rmse\n")
         for r in results:
@@ -192,9 +249,12 @@ def main():
     code_data = Path(paths["code_data"])
     output_root = Path(__file__).resolve().parent / "results"
     rs = cfg["evaluation"]["random_state"]
+    use_scale = cfg.get("preprocessing", {}).get("scale", True)
 
     datasets = [args.dataset] if args.dataset else cfg["datasets"]
     exclude_cfg = cfg.get("exclude", {})
+    grid_cfg = cfg.get("grid_search", {})
+    do_grid = grid_cfg.get("enabled", False)
 
     for ds in datasets:
         data = load_dataset(ds, exp_res, code_data, exclude_cfg.get(ds, []))
@@ -205,7 +265,10 @@ def main():
         for name, mcfg in cfg["models"].items():
             if not mcfg.get("enabled", True):
                 continue
-            loo_evaluate(data, ds, name, mcfg, output_root / ds / name, rs)
+            if do_grid:
+                mcfg = grid_search_best_params(data, name, mcfg, grid_cfg,
+                                               use_scale, rs)
+            loo_evaluate(data, ds, name, mcfg, output_root / ds / name, rs, use_scale)
 
     print(f"\n结果保存至: {output_root}")
 
