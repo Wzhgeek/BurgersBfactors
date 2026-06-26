@@ -22,14 +22,19 @@ paths:
 
 # ── 特征 ──
 features:
-  type: stats                   # stats | trj
+  type: stats
   stats_names: [max, min, mean, var, median, std]
-  # 每个 eps 文件包含 num_levels × len(stats_names) 列
   num_levels: 10
-  # eps 范围（从文件名解析）
   eps_start: 0.1
   eps_stop: 10.0
   eps_step: 0.1
+  # eps_aggregation: [mean, max, min, std]   # 可选：跨 eps 聚合
+
+# ── 网格搜索 ──
+grid_search:
+  enabled: true
+  cv_folds: 5                   # GroupKFold 折数（按蛋白分组）
+  random_state: 42
 
 # ── 模型 ──
 models:
@@ -41,18 +46,31 @@ models:
     learning_rate: 0.002
     subsample: 0.8
     max_features: sqrt
+    # 网格搜索空间（grid_search.enabled=true 时覆盖上述默认值）
+    param_grid:
+      n_estimators: [500, 1000]
+      max_depth: [5, 7, 9]
+      learning_rate: [0.001, 0.005, 0.01]
+      subsample: [0.6, 0.8]
   RF:
     enabled: true
     n_estimators: 1000
     max_depth: 8
     min_samples_split: 4
     min_samples_leaf: 2
+    param_grid:
+      n_estimators: [500, 1000]
+      max_depth: [5, 8, 12]
+      min_samples_leaf: [1, 2, 4]
 
 # ── 预处理 ──
 preprocessing:
-  scale: true                   # StandardScaler
+  scale: true
+  pca:
+    enabled: false
+    n_components: 0.99
 
 # ── 评估 ──
 evaluation:
-  mode: loo                     # leave-one-protein-out
+  mode: loo
   random_state: 42
