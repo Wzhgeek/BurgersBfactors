@@ -1,6 +1,6 @@
 # Author: Zihan Wang
 # <wangzh011031@163.com>
-# BlindPre LOO 盲测配置
+# BlindPre LOO 盲测配置（与 B-factor 保持一致）
 
 # ── 数据集 ──
 datasets:
@@ -8,7 +8,7 @@ datasets:
   - 35large
   - 36med
 
-# ── 排除蛋白（与 MDG Bfactor-small 对齐） ──
+# ── 排除蛋白（与 B-factor small 对齐） ──
 exclude:
   33small:
     - 1OB4
@@ -20,22 +20,6 @@ paths:
   exp_res: /Volumes/CodeandDataset/ProNAB/BfactorBT/EXP_RES
   code_data: /Volumes/CodeandDataset/ProNAB/BfactorBT/code_data
 
-# ── 特征 ──
-features:
-  type: stats
-  stats_names: [max, min, mean, var, median, std]
-  num_levels: 10
-  eps_start: 0.1
-  eps_stop: 10.0
-  eps_step: 0.1
-  # eps_aggregation: [mean, max, min, std]   # 可选：跨 eps 聚合
-
-# ── 网格搜索 ──
-grid_search:
-  enabled: true
-  cv_folds: 5                   # GroupKFold 折数（按蛋白分组）
-  random_state: 42
-
 # ── 模型 ──
 models:
   GBDT:
@@ -46,31 +30,13 @@ models:
     learning_rate: 0.002
     subsample: 0.8
     max_features: sqrt
-    # 网格搜索空间（grid_search.enabled=true 时覆盖上述默认值）
-    param_grid:
-      n_estimators: [500, 1000, 1500]      # 默认 1000
-      max_depth: [5, 7, 10]                # 默认 7
-      learning_rate: [0.001, 0.002, 0.005] # 默认 0.002
-      subsample: [0.6, 0.8, 1.0]           # 默认 0.8
   RF:
     enabled: true
     n_estimators: 1000
     max_depth: 8
     min_samples_split: 4
     min_samples_leaf: 2
-    param_grid:
-      n_estimators: [500, 1000, 1500]      # 默认 1000
-      max_depth: [5, 8, 15]                # 默认 8
-      min_samples_leaf: [1, 2, 4]           # 默认 2
-
-# ── 预处理 ──
-preprocessing:
-  scale: true
-  pca:
-    enabled: false
-    n_components: 0.99
 
 # ── 评估 ──
 evaluation:
-  mode: loo
   random_state: 42
