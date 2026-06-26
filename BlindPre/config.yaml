@@ -35,7 +35,7 @@ models:
     subsample: 0.8
     max_features: sqrt
     param_grid:
-      n_estimators: [500, 1000]
+      n_estimators: [500, 1000, 1500]
       max_depth: [5, 7, 10]
       learning_rate: [0.001, 0.002, 0.005]
       subsample: [0.6, 0.8, 1.0]
@@ -46,7 +46,7 @@ models:
     min_samples_split: 4
     min_samples_leaf: 2
     param_grid:
-      n_estimators: [500, 1000]
+      n_estimators: [500, 1000, 1500]
       max_depth: [5, 8, 15]
       min_samples_leaf: [1, 2, 4]
 
