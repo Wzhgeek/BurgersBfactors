@@ -8,6 +8,13 @@ datasets:
   - 35large
   - 36med
 
+# ── 排除蛋白（与 MDG Bfactor-small 对齐） ──
+exclude:
+  33small:
+    - 1OB4
+    - 1OB7
+    - 2OLX
+
 # ── 路径 ──
 paths:
   exp_res: /Volumes/CodeandDataset/ProNAB/BfactorBT/EXP_RES

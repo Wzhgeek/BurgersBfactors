@@ -95,18 +95,27 @@ def load_protein_features(pdb_id: str, dataset: str,
     return X, y
 
 
-def load_dataset(dataset: str, exp_res: Path, code_data: Path
+def load_dataset(dataset: str, exp_res: Path, code_data: Path,
+                 exclude: list[str] | None = None
                  ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """加载整个数据集。"""
     ds_dir = exp_res / dataset
     if not ds_dir.exists():
         raise FileNotFoundError(f"数据集目录不存在: {ds_dir}")
 
-    proteins = sorted(
-        p.name for p in ds_dir.iterdir()
+    if exclude is None:
+        exclude = []
+
+    proteins = [
+        p.name for p in sorted(ds_dir.iterdir())
         if p.is_dir() and (p / "features" / "stats").exists()
-    )
-    print(f"\n加载 {dataset} ({len(proteins)} proteins):")
+        and p.name not in exclude
+    ]
+    if exclude:
+        removed = [p for p in exclude if (ds_dir / p).exists()]
+        print(f"\n加载 {dataset} ({len(proteins)} proteins, 排除 {len(removed)}: {removed}):")
+    else:
+        print(f"\n加载 {dataset} ({len(proteins)} proteins):")
 
     data = {}
     n_skipped = 0
@@ -256,9 +265,11 @@ def main():
     random_state = eval_cfg.get("random_state", 42)
 
     all_summaries = []
+    exclude_cfg = cfg.get("exclude", {})
 
     for ds in datasets:
-        data = load_dataset(ds, exp_res, code_data)
+        exclude_list = exclude_cfg.get(ds, [])
+        data = load_dataset(ds, exp_res, code_data, exclude_list)
         if len(data) < 2:
             print(f"[SKIP] {ds}: 蛋白数不足 ({len(data)})")
             continue
