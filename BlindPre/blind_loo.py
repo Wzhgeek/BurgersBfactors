@@ -66,8 +66,20 @@ def load_labels(xyzb_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return np.array(values, dtype=np.float64), np.array(valid_mask, dtype=bool)
 
 
+def _get_col_indices(first_csv: Path, stats_names: list[str]) -> list[int]:
+    """从 CSV 表头提取指定 stat 的列索引。"""
+    with open(first_csv) as f:
+        header = f.readline().strip().split(",")  # L01_max, L01_min, ...
+    indices = []
+    for i, col in enumerate(header):
+        if any(col.endswith(f"_{s}") for s in stats_names):
+            indices.append(i)
+    return indices
+
+
 def load_protein_features(pdb_id: str, dataset: str,
                           exp_res: Path, code_data: Path,
+                          stats_names: list[str] | None = None,
                           eps_agg_methods: list[str] | None = None
                           ) -> tuple[np.ndarray, np.ndarray] | None:
     stats_dir = exp_res / dataset / pdb_id / "features" / "stats"
@@ -89,9 +101,17 @@ def load_protein_features(pdb_id: str, dataset: str,
     extra = f" (丢弃 {n_dropped} 个无效标签)" if n_dropped > 0 else ""
 
     files = sorted(stats_dir.glob("*.csv"), key=lambda f: parse_eps(f.name))
+    # 确定要保留的列
+    if stats_names:
+        col_idx = _get_col_indices(files[0], stats_names)
+    else:
+        col_idx = None
+
     parts = []
     for f in files:
         feat = np.loadtxt(f, delimiter=",", skiprows=1, dtype=np.float64)
+        if col_idx is not None:
+            feat = feat[:, col_idx]
         if feat.shape[0] == len(y):
             feat_valid = feat
         elif feat.shape[0] == len(valid_mask):
@@ -133,6 +153,7 @@ def _aggregate_across_eps(parts: list[np.ndarray],
 
 def load_dataset(dataset: str, exp_res: Path, code_data: Path,
                  exclude: list[str] | None = None,
+                 stats_names: list[str] | None = None,
                  eps_agg_methods: list[str] | None = None
                  ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     ds_dir = exp_res / dataset
@@ -156,7 +177,8 @@ def load_dataset(dataset: str, exp_res: Path, code_data: Path,
     data = {}
     n_skipped = 0
     for pdb in proteins:
-        result = load_protein_features(pdb, dataset, exp_res, code_data, eps_agg_methods)
+        result = load_protein_features(pdb, dataset, exp_res, code_data,
+                                        stats_names, eps_agg_methods)
         if result is not None:
             data[pdb] = result
         else:
@@ -378,6 +400,11 @@ def main():
     eps_agg_methods = feat_cfg.get("eps_aggregation", None)
     if isinstance(eps_agg_methods, list) and len(eps_agg_methods) == 0:
         eps_agg_methods = None
+    stats_names = feat_cfg.get("stats_names", None)
+    # 如果请求全部 6 个 stat 则不筛选（保持兼容）
+    ALL_STATS = ["max", "min", "mean", "var", "median", "std"]
+    if stats_names and set(stats_names) == set(ALL_STATS):
+        stats_names = None
 
     pre_cfg = cfg.get("preprocessing", {})
     use_scale = pre_cfg.get("scale", True)
@@ -394,7 +421,7 @@ def main():
 
     for ds in datasets:
         exclude_list = exclude_cfg.get(ds, [])
-        data = load_dataset(ds, exp_res, code_data, exclude_list, eps_agg_methods)
+        data = load_dataset(ds, exp_res, code_data, exclude_list, stats_names, eps_agg_methods)
         if len(data) < 2:
             print(f"[SKIP] {ds}: 蛋白数不足 ({len(data)})")
             continue
@@ -402,12 +429,15 @@ def main():
         # 确定输出路径后缀
         use_pca = pca_cfg and pca_cfg.get("enabled", False)
         use_agg = bool(eps_agg_methods)
+        use_stat_filter = bool(stats_names)
         if use_agg:
             suffix = f"Agg_{''.join(eps_agg_methods)}"
         elif use_pca:
             suffix = f"PCA{pca_cfg['n_components']}"
         elif do_grid:
             suffix = "GridSearch"
+        elif use_stat_filter:
+            suffix = f"Stats_{''.join(stats_names)}"
         else:
             suffix = "Full"
 

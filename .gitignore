@@ -18,8 +18,11 @@ logs/
 docs/
 docs/
 
-# Large data
+# scRNA data (large generated files)
 scRNA/scRNA_data/
+scRNA/preprocessed/
+scRNA/data_aij/
+scRNA/burgers_sim/
 
 # IDE
 .idea/

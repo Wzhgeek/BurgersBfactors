@@ -1,0 +1,63 @@
+# scRNA 细胞图构建 + Burgers 模拟配置
+
+# ── 数据片（13个） ──
+slices:
+  - GSE45719
+  - GSE67835
+  - GSE75748_time
+  - GSE84133_mouse1
+  - GSE84133_human4
+  - GSE75748_cell
+  - GSE84133_mouse2
+  - GSE82187
+  - GSE89232
+  - GSE59114_C57BL6
+  - GSE94820_discovery
+  - GSE84133_human2
+  - GSE84133_human1
+
+# ── 路径 ──
+paths:
+  input_dir: preprocessed
+  output_dir: data_aij
+  sim_dir: burgers_sim
+
+# ── 图结构 ──
+graph:
+  num_levels: 10
+  percentile_start: 5
+  percentile_stop: 95
+  aij_k: 1                    # exp(-d^k/(k*sigma^k))
+
+# ── 动力学参数 ──
+dynamics:
+  dt: 0.001
+  dx: 1.0
+  nu: 0.001
+  coupling_mode: graph_diffusion
+  n_steps_ref_eps: 0.1
+  decay_threshold: 0.1
+
+# ── 耦合强度扫描 ──
+epsilon:
+  start: 0.1
+  stop: 10.0
+  step: 0.1
+
+# ── 特征 ──
+features:
+  stats:
+    enabled: true
+    names: [max, min, mean, var, median, std]
+  trajectory:
+    enabled: true
+    n_points: 100
+
+# ── 并行 ──
+parallel:
+  n_jobs: -1                   # -1 = cpu_count()
+
+# ── 烟雾测试 ──
+smoke:
+  level: 5
+  eps: 0.5

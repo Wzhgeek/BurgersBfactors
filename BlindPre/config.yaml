@@ -48,10 +48,10 @@ models:
     max_features: sqrt
     # 网格搜索空间（grid_search.enabled=true 时覆盖上述默认值）
     param_grid:
-      n_estimators: [500, 1000]
-      max_depth: [5, 7, 9]
-      learning_rate: [0.001, 0.005, 0.01]
-      subsample: [0.6, 0.8]
+      n_estimators: [500, 1000, 1500]      # 默认 1000
+      max_depth: [5, 7, 10]                # 默认 7
+      learning_rate: [0.001, 0.002, 0.005] # 默认 0.002
+      subsample: [0.6, 0.8, 1.0]           # 默认 0.8
   RF:
     enabled: true
     n_estimators: 1000
@@ -59,9 +59,9 @@ models:
     min_samples_split: 4
     min_samples_leaf: 2
     param_grid:
-      n_estimators: [500, 1000]
-      max_depth: [5, 8, 12]
-      min_samples_leaf: [1, 2, 4]
+      n_estimators: [500, 1000, 1500]      # 默认 1000
+      max_depth: [5, 8, 15]                # 默认 8
+      min_samples_leaf: [1, 2, 4]           # 默认 2
 
 # ── 预处理 ──
 preprocessing:
