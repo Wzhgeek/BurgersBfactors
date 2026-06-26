@@ -18,6 +18,9 @@ logs/
 docs/
 docs/
 
+# Large data
+scRNA/scRNA_data/
+
 # IDE
 .idea/
 .vscode/

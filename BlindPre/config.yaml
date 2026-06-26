@@ -1,0 +1,51 @@
+# Author: Zihan Wang
+# <wangzh011031@163.com>
+# BlindPre LOO 盲测配置
+
+# ── 数据集 ──
+datasets:
+  - 33small
+  - 35large
+  - 36med
+
+# ── 路径 ──
+paths:
+  exp_res: /Volumes/CodeandDataset/ProNAB/BfactorBT/EXP_RES
+  code_data: /Volumes/CodeandDataset/ProNAB/BfactorBT/code_data
+
+# ── 特征 ──
+features:
+  type: stats                   # stats | trj
+  stats_names: [max, min, mean, var, median, std]
+  # 每个 eps 文件包含 num_levels × len(stats_names) 列
+  num_levels: 10
+  # eps 范围（从文件名解析）
+  eps_start: 0.1
+  eps_stop: 10.0
+  eps_step: 0.1
+
+# ── 模型 ──
+models:
+  GBDT:
+    enabled: true
+    n_estimators: 1000
+    max_depth: 7
+    min_samples_split: 5
+    learning_rate: 0.002
+    subsample: 0.8
+    max_features: sqrt
+  RF:
+    enabled: true
+    n_estimators: 1000
+    max_depth: 8
+    min_samples_split: 4
+    min_samples_leaf: 2
+
+# ── 预处理 ──
+preprocessing:
+  scale: true                   # StandardScaler
+
+# ── 评估 ──
+evaluation:
+  mode: loo                     # leave-one-protein-out
+  random_state: 42
