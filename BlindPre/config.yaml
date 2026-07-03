@@ -16,40 +16,80 @@ paths:
   exp_res: /Volumes/CodeandDataset/ProNAB/BfactorBT/EXP_RES
   code_data: /Volumes/CodeandDataset/ProNAB/BfactorBT/code_data
 
+# ── 每 level 最优 eps（从 holdout CV 结果聚合） ──
+# 设置后仅使用每个 level 的指定 eps，特征维度 10×6=60
+feature_type: stats
+per_level_eps:
+  33small:
+    L01: 2.7
+    L02: 3.1
+    L03: 2.3
+    L04: 3.4
+    L05: 3.4
+    L06: 3.6
+    L07: 3.7
+    L08: 5.1
+    L09: 4.1
+    L10: 4.2
+  35large:
+    L01: 6.1
+    L02: 3.5
+    L03: 4.1
+    L04: 4.9
+    L05: 4.4
+    L06: 5.0
+    L07: 4.6
+    L08: 4.6
+    L09: 4.0
+    L10: 3.2
+  36med:
+    L01: 6.1
+    L02: 3.9
+    L03: 4.5
+    L04: 4.5
+    L05: 5.2
+    L06: 5.4
+    L07: 5.0
+    L08: 4.0
+    L09: 4.1
+    L10: 3.9
+# eps_sensitivity: true           # 跨 eps 敏感度 (+60d)
+# agg_across_levels: true          # 跨 level 聚合 (mean/max/min/std) → 24d
+
+# feature_prune: true
+use_topo: true                  # 拼接拓扑特征 (60d) → dynamics+topo=120d
+
 preprocessing:
-  scale: true
+  scale: false                 # 与 B-factor 一致: use_norm=False
 
 # ── 网格搜索（GroupKFold 按蛋白分组） ──
 grid_search:
-  enabled: true
+  enabled: false
   cv_folds: 3
 
 # ── 模型 ──
 models:
   GBDT:
     enabled: true
-    n_estimators: 1000
+    n_estimators: 1500
     max_depth: 7
     min_samples_split: 5
     learning_rate: 0.002
     subsample: 0.8
     max_features: sqrt
     param_grid:
-      n_estimators: [500, 1000, 1500]
+      n_estimators: [1500, 2000, 2500]
       max_depth: [5, 7, 10]
       learning_rate: [0.001, 0.002, 0.005]
       subsample: [0.6, 0.8, 1.0]
   RF:
-    enabled: true
+    enabled: false
     n_estimators: 1000
     max_depth: 8
     min_samples_split: 4
     min_samples_leaf: 2
-    param_grid:
-      n_estimators: [500, 1000, 1500]
-      max_depth: [5, 8, 15]
-      min_samples_leaf: [1, 2, 4]
 
 # ── 评估 ──
 evaluation:
+  n_cycle: 5                   # 与 B-factor 一致: 多次运行取平均
   random_state: 42
