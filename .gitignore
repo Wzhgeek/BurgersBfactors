@@ -16,13 +16,31 @@ venv/
 result/
 logs/
 docs/
-docs/
 
-# scRNA data (large generated files)
+# ── scRNA：大规模演化（ε×层 Burgers）+ strict-legacy 分类 ──
+# 入库核心：config_graph.yaml、burgers_sim.py、build_graph.py、
+#   classify_legacy_resample.py、classify_eps_scan_aggregate.py、
+#   classify_results_io.py、summarize_classify_slices.py、list_slices.py、
+#   sync_labels.py、classify_traj_stats.py（标签/特征 IO 工具，被主分类脚本引用）
+
+# scratch 大文件与演化输出（路径见 config_graph.yaml）
 scRNA/scRNA_data/
 scRNA/preprocessed/
 scRNA/data_aij/
 scRNA/burgers_sim/
+
+# 所有 SLURM 提交脚本与 worker（gateway 本地使用，不入库）
+scRNA/*.sh
+
+# 非本次实验：轨迹100点分析、预处理、原始数据包
+scRNA/analyze_traj_100pts.py
+scRNA/preprocess_scRNA.py
+scRNA/Single Cell RNA Sequencing/
+
+# 分类/分析结果（应在 scratch 或本地，不入库）
+scRNA/GSE*/
+scRNA/legacy_classify_summary/
+scRNA/logs/
 
 # IDE
 .idea/

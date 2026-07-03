@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .burgers import rk4_step
+from .burgers import rk4_step, precompute_laplacian
 
 
 # ── 统计特征 ──────────────────────────────────────────────────────────────
@@ -66,9 +66,12 @@ def simulate_trajectories(
         trj: (n_atoms, n_sample_points) 采样轨迹。
         stats: (n_atoms, 6) 统计特征 [max, min, mean, var, median, std]。
     """
-    # 等距采样步索引（0 ~ n_steps，含两端）
+    # boolean 掩码替代 set 查找，O(1) 数组索引无 Python hash 开销
     sample_steps = np.linspace(0, n_steps, n_sample_points, dtype=int)
-    sample_set = set(sample_steps.tolist())
+    sample_mask = np.zeros(n_steps + 1, dtype=bool)
+    sample_mask[sample_steps] = True
+    # 预计算图拉普拉斯：L 在整个模拟期间不变，避免每次 rk4_step 内重建
+    L_cache = precompute_laplacian(A) if coupling_mode == "graph_diffusion" else None
 
     trj = np.zeros((n_atoms, n_sample_points), dtype=np.float64)
 
@@ -78,12 +81,12 @@ def simulate_trajectories(
         save_idx = 0
 
         for step in range(n_steps + 1):
-            if step in sample_set:
+            if sample_mask[step]:
                 trj[i, save_idx] = u[i]
                 save_idx += 1
 
             if step < n_steps:
-                u = rk4_step(u, dt, A, nu, epsilon, dx, coupling_mode)
+                u = rk4_step(u, dt, A, nu, epsilon, dx, coupling_mode, L_cache=L_cache)
 
     return trj, extract_stats_features(trj)
 
