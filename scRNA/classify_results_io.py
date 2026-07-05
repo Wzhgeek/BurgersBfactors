@@ -3,11 +3,11 @@
 """
 分类结果落盘：对齐 Pcode 蛋白回归目录结构。
 
-每 slice:
-  legacy_classify/all_score/{slice}_all_{metric}.csv   # ε×层 网格
-  legacy_classify/result.json                          # slice 级最优与 per-level 汇总
+路径见 config_graph.yaml paths.classify_dir（scratch）:
+  {classify_dir}/{slice}/all_score/{slice}_all_{metric}.csv
+  {classify_dir}/{slice}/result.json
 
-跨 slice 汇总见 summarize_classify_slices.py。
+跨 slice 汇总见 paths.classify_summary_dir。
 """
 from __future__ import annotations
 
@@ -16,7 +16,17 @@ from pathlib import Path
 
 import numpy as np
 
-from scRNA.classify_traj_stats import eps_tag
+from scRNA.classify_traj_stats import eps_tag, resolve_path
+
+
+def legacy_classify_dir(cfg: dict, scrna_dir: Path, slice_name: str) -> Path:
+    """单 slice 分类结果根目录：{classify_dir}/{slice}/。"""
+    return resolve_path(scrna_dir, cfg["paths"]["classify_dir"]) / slice_name
+
+
+def classify_summary_dir(cfg: dict, scrna_dir: Path) -> Path:
+    """跨 slice 汇总 CSV 目录。"""
+    return resolve_path(scrna_dir, cfg["paths"]["classify_summary_dir"])
 
 # grid 字段 → all_score 文件名后缀
 GRID_METRICS: dict[str, str] = {

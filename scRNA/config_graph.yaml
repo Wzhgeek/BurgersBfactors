@@ -3,6 +3,7 @@
 # scRNA 细胞图构建 + Burgers 模拟配置
 
 # ── 数据片（与 scratch/data_aij 目录名一致，共 14 个） ──
+# 演化默认跳过 evolution.exclude 中的 slice（仍可手动 --slice 指定）
 slices:
   - GSE45719
   - GSE67835
@@ -19,12 +20,22 @@ slices:
   - GSE84133human1
   - GSE84133human3
 
+# ── Burgers 演化：默认不跑的 slice（分类/建图仍可用 slices 列表） ──
+evolution:
+  exclude:
+    - GSE84133human3
+
 # ── 路径（HPCC scratch，大文件勿放 Pcode 仓库目录） ──
 paths:
   scratch_root: /mnt/gs21/scratch/jiangj33/scRNA
   input_dir: /mnt/gs21/scratch/jiangj33/scRNA/preprocessed
   output_dir: /mnt/gs21/scratch/jiangj33/scRNA/data_aij
   sim_dir: /mnt/gs21/scratch/jiangj33/scRNA/burgers_sim
+  # 分类结果（partial / scan / all_score / result.json）
+  classify_dir: /mnt/gs21/scratch/jiangj33/scRNA/legacy_classify
+  classify_summary_dir: /mnt/gs21/scratch/jiangj33/scRNA/legacy_classify_summary
+  topo_features_dir: /mnt/gs21/scratch/jiangj33/scRNA/topo_features
+  topo_features_tag: scanpy_qc_hvg2000_pca30
 
 # ── 图结构 ──
 graph:
@@ -32,10 +43,26 @@ graph:
   percentile_start: 5
   percentile_stop: 95
   aij_k: 1                    # exp(-d^k/(k*sigma^k))
-  default_mode: both          # euclidean | pearson | both（build_graph.py 默认构建哪些）
-  sim_mode: pearson           # burgers_sim.py 读取 Aij 的子目录（pearson | euclidean | root）
+  default_mode: euclidean          # QC → CPM/10k+log1p → HVG2000 → z-score → PCA30 → 欧氏
+  sim_mode: euclidean
+  qc:
+    enabled: true
+    min_genes: 200              # 过滤低质量细胞
+    min_cells: 3                # 过滤低表达基因
+    min_counts: null
+    max_genes: null
+  pca:
+    preprocess: scanpy
+    distance_space: pca
+    use_pca: true
+    n_hvg: 2000
+    n_pcs: 30                   # 可改为 50
+    hvg_flavor: seurat
+    target_sum: 10000           # CPM/10k
+    scale_before_pca: true      # HVG 矩阵按基因 z-score
+  euclidean: {}
   pearson:
-    enabled: true             # 与 default_mode=both 配合，额外生成 pearson/ 子目录
+    enabled: false                  # 当前主流程仅 HVG 欧氏
     eta: 3                    # conn = 1 - exp(-(r/eta)^kappa)，与旧 GSE 脚本一致
     kappa: 1
     clip_negative: true       # Pearson 负相关置 0

@@ -22,6 +22,8 @@ from pathlib import Path
 # 复用 Pcode 核心模块（必须在其他 src import 之前）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from scRNA.list_slices import evolution_exclude
+
 import argparse
 import json
 import time
@@ -29,6 +31,17 @@ from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import yaml
+
+
+def resolve_evolution_slices(cfg: dict, slice_name: str | None = None) -> list[str]:
+    """返回待演化 slice；跳过 config evolution.exclude。"""
+    excluded = evolution_exclude(cfg)
+    if slice_name:
+        if slice_name in excluded:
+            print(f"  SKIP {slice_name}: 在 evolution.exclude 中（不再演化）")
+            return []
+        return [slice_name]
+    return [s for s in cfg["slices"] if s not in excluded]
 
 from src.burgers import rk4_step, rk4_step_batch, precompute_laplacian
 from src.features import extract_stats_features
@@ -724,7 +737,9 @@ def main():
         return 1
 
     if args.aggregate:
-        slices = [args.slice] if args.slice else cfg["slices"]
+        slices = resolve_evolution_slices(cfg, args.slice)
+        if not slices:
+            return 0
         ok = 0
         for s in slices:
             if aggregate_slice(s, sim_dir, cfg):
@@ -732,9 +747,9 @@ def main():
         print(f"\n汇总完成: {ok}/{len(slices)} slices")
         return 0 if ok == len(slices) else 1
 
-    slices = cfg["slices"]
-    if args.slice:
-        slices = [args.slice]
+    slices = resolve_evolution_slices(cfg, args.slice)
+    if not slices:
+        return 0
 
     sim_dir.mkdir(parents=True, exist_ok=True)
     smoke_tag = " [SMOKE]" if args.smoke else ""

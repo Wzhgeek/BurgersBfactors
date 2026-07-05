@@ -1,0 +1,101 @@
+# Author: Zihan Wang
+# <wangzh011031@163.com>
+# PC3 专用配置：与 PC30 完全隔离，勿覆盖 data_aij / topo_features 主目录
+#
+# 构图流程:
+#   1. QC 过滤低质量细胞/基因 (min_genes=200, min_cells=3)
+#   2. normalize_total(1e4) + log1p
+#   3. HVG 2000 (scanpy seurat)
+#   4. HVG 表达矩阵 z-score
+#   5. PCA → 3 维
+#   6. PC 空间欧氏距离 → 10 层 Aij
+
+slices:
+  - GSE45719
+  - GSE67835
+  - GSE75748time
+  - GSE84133mouse1
+  - GSE84133human4
+  - GSE75748cell
+  - GSE84133mouse2
+  - GSE82187
+  - GSE89232
+  - GSE59114
+  - GSE94820
+  - GSE84133human2
+  - GSE84133human1
+  - GSE84133human3
+
+evolution:
+  exclude:
+    - GSE84133human3
+
+paths:
+  scratch_root: /mnt/gs21/scratch/jiangj33/scRNA
+  input_dir: /mnt/gs21/scratch/jiangj33/scRNA/preprocessed
+  output_dir: /mnt/gs21/scratch/jiangj33/scRNA/data_aij_pc3
+  sim_dir: /mnt/gs21/scratch/jiangj33/scRNA/burgers_sim_pc3
+  classify_dir: /mnt/gs21/scratch/jiangj33/scRNA/legacy_classify_pc3
+  classify_summary_dir: /mnt/gs21/scratch/jiangj33/scRNA/legacy_classify_summary_pc3
+  topo_features_dir: /mnt/gs21/scratch/jiangj33/scRNA/topo_features
+  topo_features_tag: scanpy_qc_hvg2000_pca3
+
+graph:
+  num_levels: 10
+  percentile_start: 5
+  percentile_stop: 95
+  aij_k: 1
+  default_mode: euclidean
+  sim_mode: euclidean
+  qc:
+    enabled: true
+    min_genes: 200
+    min_cells: 3
+    min_counts: null
+    max_genes: null
+  pca:
+    preprocess: scanpy
+    distance_space: pca
+    use_pca: true
+    n_hvg: 2000
+    n_pcs: 3
+    hvg_flavor: seurat
+    target_sum: 10000
+    scale_before_pca: true
+  euclidean: {}
+  pearson:
+    enabled: false
+    eta: 3
+    kappa: 1
+    clip_negative: true
+
+dynamics:
+  dt: 0.001
+  dx: 1.0
+  nu: 0.001
+  coupling_mode: graph_diffusion
+  n_steps: 3000
+  n_steps_ref_eps: 1.0
+  decay_threshold: 0.1
+  early_stop_fraction: 1.0
+  max_steps: 10000
+
+epsilon:
+  value: 1.0
+
+features:
+  stats:
+    enabled: true
+    names: [max, min, mean, var, median, std]
+  trajectory:
+    enabled: true
+    n_points: 3001
+
+parallel:
+  n_jobs: -1
+
+slice_overrides: {}
+
+smoke:
+  level: 5
+  eps: 1.0

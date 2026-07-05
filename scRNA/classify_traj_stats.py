@@ -96,41 +96,49 @@ def load_labels(
     aij_dir: Path | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     scrna_dir = Path(__file__).resolve().parent
-    candidates = [
-        label_dir / slice_name / "labels.csv",
-        scrna_dir / "preprocessed" / slice_name / "labels.csv",
-    ]
+    candidates: list[Path] = []
     if aij_dir is not None:
         candidates.extend([
             aij_dir / slice_name / "labels.csv",
             aij_dir / slice_name / f"{slice_name}_full_labels.csv",
         ])
-    labels_path = next((p for p in candidates if p.exists()), None)
-    if labels_path is None:
+    candidates.extend([
+        label_dir / slice_name / "labels.csv",
+        scrna_dir / "preprocessed" / slice_name / "labels.csv",
+    ])
+    existing = [p for p in candidates if p.exists()]
+    if not existing:
         raise FileNotFoundError(
             f"{slice_name}: 未找到 labels，已尝试: {[str(p) for p in candidates]}"
         )
 
-    labels: list[int] = []
-    types: list[str] = []
-    with open(labels_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if "label" in row:
-                labels.append(int(row["label"]))
-                types.append(row.get("cell_type", ""))
-            elif "Label" in row:
-                labels.append(int(row["Label"]))
-                types.append(row.get("Cell type", row.get("cell_type", "")))
-            else:
-                raise ValueError(f"{labels_path}: 无法识别标签列 {reader.fieldnames}")
+    def _parse_labels(path: Path) -> tuple[np.ndarray, list[str]]:
+        labels: list[int] = []
+        types: list[str] = []
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if "label" in row:
+                    labels.append(int(row["label"]))
+                    types.append(row.get("cell_type", ""))
+                elif "Label" in row:
+                    labels.append(int(row["Label"]))
+                    types.append(row.get("Cell type", row.get("cell_type", "")))
+                else:
+                    raise ValueError(f"{path}: 无法识别标签列 {reader.fieldnames}")
+        return np.array(labels, dtype=np.int64), types
 
-    y = np.array(labels, dtype=np.int64)
-    if y.shape[0] != n_cells:
-        raise ValueError(
-            f"{slice_name}: labels 行数 {y.shape[0]} != n_cells {n_cells} ({labels_path})"
-        )
-    return y, types
+    for labels_path in existing:
+        y, types = _parse_labels(labels_path)
+        if y.shape[0] == n_cells:
+            return y, types
+
+    labels_path = existing[0]
+    y, types = _parse_labels(labels_path)
+    raise ValueError(
+        f"{slice_name}: labels 行数 {y.shape[0]} != n_cells {n_cells} "
+        f"({labels_path}); 已尝试: {[str(p) for p in existing]}"
+    )
 
 
 def load_n_cells(aij_dir: Path, slice_name: str, graph_mode: str) -> int:
@@ -141,6 +149,204 @@ def load_n_cells(aij_dir: Path, slice_name: str, graph_mode: str) -> int:
         raise FileNotFoundError(f"缺少 thresholds.json: {meta_path}")
     with open(meta_path) as f:
         return int(json.load(f)["n_cells"])
+
+
+def topo_features_root(cfg: dict, scrna_dir: Path) -> Path:
+    """拓扑特征根目录（paths.topo_features_dir[/tag] 或 scratch/topo_features）。"""
+    paths = cfg.get("paths", {})
+    root = paths.get("topo_features_dir")
+    if root:
+        p = Path(root)
+        base = p if p.is_absolute() else scrna_dir.parent / p
+    else:
+        base = resolve_path(scrna_dir, paths["scratch_root"]) / "topo_features"
+    tag = paths.get("topo_features_tag")
+    return base / tag if tag else base
+
+
+def load_level_topo(
+    topo_root: Path,
+    slice_name: str,
+    level: int,
+) -> np.ndarray:
+    """单层拓扑谱特征 (n_cells, 6)。"""
+    from src.topo_features import TOPO_FEATURE_NAMES
+
+    path = topo_root / slice_name / f"{slice_name}_topo_L{level:02d}.npy"
+    if not path.exists():
+        raise FileNotFoundError(f"缺少拓扑特征: {path}")
+    topo = np.load(path)
+    if topo.shape[1] != len(TOPO_FEATURE_NAMES):
+        raise ValueError(
+            f"{path}: 期望 {len(TOPO_FEATURE_NAMES)} 列, 实际 {topo.shape[1]}"
+        )
+    return sanitize_features(topo.astype(np.float64), f"{slice_name} L{level:02d} topo")
+
+
+def load_alllevels_stats6(
+    sim_dir: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int = 10,
+) -> np.ndarray:
+    """L01..L10 各层 stats6 拼接 → (n_cells, 6 * num_levels)。"""
+    blocks = [
+        load_level_stats(sim_dir, slice_name, lvl, tag, recompute=False)
+        for lvl in range(1, num_levels + 1)
+    ]
+    return np.hstack(blocks)
+
+
+def load_pca_coords(aij_dir: Path, slice_name: str) -> np.ndarray:
+    """读取构图阶段保存的 PCA 坐标 (n_cells, n_pcs)。"""
+    candidates = [
+        aij_dir / slice_name / "pca_coords.npy",
+        aij_dir / slice_name / "pearson" / "pca_coords.npy",
+    ]
+    for path in candidates:
+        if path.exists():
+            return np.load(path).astype(np.float64)
+    raise FileNotFoundError(
+        f"{slice_name}: 缺少 pca_coords.npy（已检查 {[str(p) for p in candidates]}）"
+    )
+
+
+def load_alllevels_stats6_pca30(
+    sim_dir: Path,
+    aij_dir: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int = 10,
+) -> np.ndarray:
+    """L01..L10 stats6 (60维) + PCA 坐标 → (n_cells, 6*num_levels + n_pcs)。"""
+    stats = load_alllevels_stats6(sim_dir, slice_name, tag, num_levels=num_levels)
+    pca = load_pca_coords(aij_dir, slice_name)
+    if stats.shape[0] != pca.shape[0]:
+        raise ValueError(
+            f"{slice_name}: stats {stats.shape[0]} 行 != pca {pca.shape[0]} 行"
+        )
+    return np.hstack([stats, pca])
+
+
+def load_alllevels_stats6_topo6_pca30(
+    sim_dir: Path,
+    topo_root: Path,
+    aij_dir: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int = 10,
+) -> np.ndarray:
+    """L01..L10 stats6+topo6 (120维) + PCA 坐标 → (n_cells, 12*num_levels + n_pcs)。"""
+    feat = load_alllevels_stats6_topo6(
+        sim_dir, topo_root, slice_name, tag, num_levels=num_levels,
+    )
+    pca = load_pca_coords(aij_dir, slice_name)
+    if feat.shape[0] != pca.shape[0]:
+        raise ValueError(
+            f"{slice_name}: stats+topo {feat.shape[0]} 行 != pca {pca.shape[0]} 行"
+        )
+    return np.hstack([feat, pca])
+
+
+def all_levels_stats_ready(
+    sim_dir: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int,
+) -> bool:
+    """检查 L01..L10 的 stats 是否齐全。"""
+    for lvl in range(1, num_levels + 1):
+        stats_path = partial_level_dir(sim_dir, slice_name, lvl) / f"stats_{tag}.npy"
+        if not stats_path.exists():
+            return False
+    return True
+
+
+def all_levels_trj_ready(
+    sim_dir: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int,
+) -> bool:
+    """检查 L01..L10 的 trj 是否齐全。"""
+    for lvl in range(1, num_levels + 1):
+        trj_path = partial_level_dir(sim_dir, slice_name, lvl) / f"trj_{tag}.npy"
+        if not trj_path.exists():
+            return False
+    return True
+
+
+def load_alllevels_traj100(
+    sim_dir: Path,
+    slice_name: str,
+    tag: str,
+    sample_idx: np.ndarray,
+    num_levels: int = 10,
+) -> np.ndarray:
+    """L01..L10 各层 traj100 → (n_cells, num_levels, len(sample_idx))。"""
+    from scRNA.analyze_traj_100pts import load_level_traj_features
+
+    blocks: list[np.ndarray] = []
+    for lvl in range(1, num_levels + 1):
+        blocks.append(
+            load_level_traj_features(sim_dir, slice_name, lvl, tag, sample_idx),
+        )
+    return np.stack(blocks, axis=1).astype(np.float64)
+
+
+def load_level_traj_full(
+    sim_dir: Path,
+    slice_name: str,
+    level: int,
+    tag: str,
+) -> np.ndarray:
+    """单层完整保存轨迹 → (n_cells, n_traj_points)。"""
+    trj_path = partial_level_dir(sim_dir, slice_name, level) / f"trj_{tag}.npy"
+    return np.load(trj_path).astype(np.float64)
+
+
+def load_alllevels_traj_full(
+    sim_dir: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int = 10,
+) -> np.ndarray:
+    """L01..L10 各层完整轨迹 → (n_cells, num_levels, n_traj_points)。"""
+    blocks: list[np.ndarray] = []
+    for lvl in range(1, num_levels + 1):
+        blocks.append(load_level_traj_full(sim_dir, slice_name, lvl, tag))
+    return np.stack(blocks, axis=1).astype(np.float64)
+
+
+def load_alllevels_stats6_topo6(
+    sim_dir: Path,
+    topo_root: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int = 10,
+) -> np.ndarray:
+    """L01..L10 各层 stats6+topo6 拼接 → (n_cells, 12 * num_levels)。"""
+    blocks: list[np.ndarray] = []
+    for lvl in range(1, num_levels + 1):
+        blocks.append(load_level_stats(sim_dir, slice_name, lvl, tag, recompute=False))
+        blocks.append(load_level_topo(topo_root, slice_name, lvl))
+    return np.hstack(blocks)
+
+
+def all_levels_stats_topo_ready(
+    sim_dir: Path,
+    topo_root: Path,
+    slice_name: str,
+    tag: str,
+    num_levels: int,
+) -> bool:
+    """检查 L01..L10 的 stats 与 topo 是否齐全。"""
+    for lvl in range(1, num_levels + 1):
+        stats_path = partial_level_dir(sim_dir, slice_name, lvl) / f"stats_{tag}.npy"
+        topo_path = topo_root / slice_name / f"{slice_name}_topo_L{lvl:02d}.npy"
+        if not stats_path.exists() or not topo_path.exists():
+            return False
+    return True
 
 
 def load_level_stats(

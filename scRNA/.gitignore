@@ -1,0 +1,29 @@
+# Author: Zihan Wang
+# <wangzh011031@163.com>
+# scRNA 主流程入库：排除 SLURM 脚本、过程数据、验证/诊断类脚本
+
+# ── scratch 过程数据与演化/分类输出 ──
+scRNA_data/
+preprocessed/
+data_aij/
+burgers_sim/
+legacy_classify_summary/
+GSE*/
+logs/
+
+# 原始数据包
+Single Cell RNA Sequencing/
+
+# SLURM 提交与 worker 脚本（gateway 本地使用，不入库）
+*.sh
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 非主流程：验证 / 诊断 / PCA 扫描 / 对比分析 / 轨迹点分析
+validate_expression_labels.py
+GSE59114_diagnose.py
+auto_pcs_variance_scan.py
+compare_pca_hvg_cumvr.py
+analyze_traj_100pts.py

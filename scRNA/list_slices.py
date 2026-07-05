@@ -38,6 +38,12 @@ def load_n_cells(data_dir: Path, slice_name: str, graph_mode: str) -> int | None
     return int(info.get("n_cells", 0))
 
 
+def evolution_exclude(cfg: dict) -> set[str]:
+    """config evolution.exclude：默认不参与 Burgers 演化提交。"""
+    raw = cfg.get("evolution", {}).get("exclude", []) or []
+    return {str(s).strip() for s in raw if str(s).strip()}
+
+
 def list_slices(cfg: dict, scrna_dir: Path, exclude: set[str]) -> list[tuple[int, str]]:
     data_dir = resolve_path(scrna_dir, cfg["paths"]["output_dir"])
     graph_mode = str(cfg.get("graph", {}).get("sim_mode", "pearson"))
@@ -66,6 +72,11 @@ def main() -> int:
         help="逗号分隔，排除的 slice",
     )
     parser.add_argument(
+        "--for-evolution",
+        action="store_true",
+        help="合并 config evolution.exclude（burgers_sim 提交用）",
+    )
+    parser.add_argument(
         "--table",
         action="store_true",
         help="打印 细胞数 + slice 表格",
@@ -75,6 +86,8 @@ def main() -> int:
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
     exclude = {s.strip() for s in args.exclude.split(",") if s.strip()}
+    if args.for_evolution:
+        exclude |= evolution_exclude(cfg)
     rows = list_slices(cfg, cfg_path.parent, exclude)
     if args.table:
         print(f"{'n_cells':>8}  slice")

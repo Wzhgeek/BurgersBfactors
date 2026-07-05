@@ -4,12 +4,12 @@
 """
 汇总 13 个 slice 分类结果 → 跨数据集最佳指标 CSV（按 BA 选取）。
 
-读取各 slice 的 legacy_classify/result.json；若缺失则尝试 scan/*.json 并导出。
+读取各 slice 的 result.json（paths.classify_dir）；若缺失则尝试 scan/*.json 并导出。
 
 用法:
     python scRNA/summarize_classify_slices.py
     python scRNA/summarize_classify_slices.py --exclude GSE84133human1
-    python scRNA/summarize_classify_slices.py --output scRNA/legacy_classify_summary/13slices_best_by_ba.csv
+    python scRNA/summarize_classify_slices.py --output /path/to/13slices_best_by_ba.csv
 """
 from __future__ import annotations
 
@@ -23,7 +23,12 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scRNA.classify_results_io import export_slice_results, load_slice_result
+from scRNA.classify_results_io import (
+    classify_summary_dir,
+    export_slice_results,
+    legacy_classify_dir,
+    load_slice_result,
+)
 from scRNA.classify_traj_stats import load_n_cells, resolve_path
 from scRNA.list_slices import list_slices
 
@@ -157,7 +162,7 @@ def main() -> int:
         "--output",
         type=Path,
         default=None,
-        help="输出 CSV（默认 scRNA/legacy_classify_summary/13slices_best_by_ba.csv）",
+        help="输出 CSV（默认 classify_summary_dir/13slices_best_by_ba.csv）",
     )
     args = parser.parse_args()
 
@@ -168,12 +173,13 @@ def main() -> int:
     slices = [name for _, name in list_slices(cfg, scrna_dir, exclude)]
 
     aij_dir = resolve_path(scrna_dir, cfg["paths"]["output_dir"])
+    sim_dir = resolve_path(scrna_dir, cfg["paths"]["sim_dir"])
     graph_mode = str(cfg.get("graph", {}).get("sim_mode", "pearson"))
 
     rows: list[dict] = []
     for slice_name in slices:
         n_cells = load_n_cells(aij_dir, slice_name, graph_mode) or 0
-        legacy_dir = scrna_dir / slice_name / "legacy_classify"
+        legacy_dir = legacy_classify_dir(cfg, scrna_dir, slice_name)
         row = collect_slice_row(slice_name, legacy_dir, n_cells)
         if row is None:
             print(f"  SKIP {slice_name}: 无 result.json / scan 结果")
@@ -191,7 +197,7 @@ def main() -> int:
 
     out_path = args.output
     if out_path is None:
-        out_path = scrna_dir / "legacy_classify_summary" / "13slices_best_by_ba.csv"
+        out_path = classify_summary_dir(cfg, scrna_dir) / "13slices_best_by_ba.csv"
     else:
         out_path = Path(out_path)
     write_summary_csv(out_path, rows)

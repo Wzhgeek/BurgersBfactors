@@ -14,6 +14,12 @@
     python classify_legacy_resample.py --slice GSE84133human1
     python classify_legacy_resample.py --slice GSE84133human1 --strict-legacy
     python classify_legacy_resample.py --slice GSE84133human1 --feature traj100 --strict-legacy
+    python classify_legacy_resample.py --slice GSE84133human1 --feature stats6_traj100 --strict-legacy
+    python classify_legacy_resample.py --slice GSE59114 --feature stats6_topo6 --strict-legacy
+    python classify_legacy_resample.py --slice GSE59114 --feature stats6_l10 --strict-legacy
+    python classify_legacy_resample.py --slice GSE59114 --feature stats6_topo6_l10 --strict-legacy
+    python classify_legacy_resample.py --slice GSE59114 --feature stats6_l10_pca30 --strict-legacy
+    python classify_legacy_resample.py --slice GSE59114 --feature stats6_topo6_l10_pca30 --strict-legacy
     python classify_legacy_resample.py --slice GSE84133human1 --level 7
     python classify_legacy_resample.py --slice GSE84133human1 --eps-list 1.0,2.0,3.0,4.0,5.0 --strict-legacy
 """
@@ -41,21 +47,39 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from scRNA.classify_lstm import compute_lstm, compute_traj_lstm, resolve_lstm_device
 from scRNA.classify_traj_stats import (
+    all_levels_stats_ready,
+    all_levels_stats_topo_ready,
+    all_levels_trj_ready,
     eps_tag,
+    load_alllevels_stats6,
+    load_alllevels_stats6_pca30,
+    load_alllevels_stats6_topo6,
+    load_alllevels_stats6_topo6_pca30,
+    load_alllevels_traj100,
+    load_alllevels_traj_full,
+    load_level_traj_full,
     load_labels,
     load_level_stats,
+    load_pca_coords,
+    load_level_topo,
     load_n_cells,
     load_yaml,
     partial_level_dir,
     resolve_path,
     sanitize_features,
+    topo_features_root,
 )
-from scRNA.analyze_traj_100pts import (
-    load_level_traj_features,
-    trajectory_sample_indices,
-)
-from scRNA.classify_results_io import export_slice_results
+from scRNA.classify_results_io import export_slice_results, legacy_classify_dir
+
+
+def _traj100_helpers():
+    from scRNA.analyze_traj_100pts import (
+        load_level_traj_features,
+        trajectory_sample_indices,
+    )
+    return load_level_traj_features, trajectory_sample_indices
 
 
 def adjust_train_test(
@@ -128,6 +152,13 @@ def adjust_train_test(
     return new_y_train, new_y_test, new_train_index, new_test_index
 
 
+def _sanitize_features(X: np.ndarray) -> np.ndarray:
+    """Burgers 高 ε 可能产生 nan/极大值，分类前清理以保证 StandardScaler/RF 可运行。"""
+    X = np.asarray(X, dtype=np.float64)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(X, -1e6, 1e6)
+
+
 def compute_rf(
     X_train: np.ndarray,
     X_test: np.ndarray,
@@ -135,6 +166,8 @@ def compute_rf(
     y_test: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """训练 RF，返回 (y_pred, y_proba, clf.classes_)。"""
+    X_train = _sanitize_features(X_train)
+    X_test = _sanitize_features(X_test)
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
@@ -195,8 +228,11 @@ def compute_kfold_classification(
     n_repeats: int = 10,
     seed_base: int = 0,
     strict_legacy: bool = False,
+    classifier: str = "rf",
+    lstm_params: dict | None = None,
 ) -> dict:
-    """5-fold × n_repeats，折内 adjust_train_test + RF，返回 BA/acc/P/R/F1/AUC/Kappa 统计。"""
+    """5-fold × n_repeats，折内 adjust_train_test + RF/LSTM，返回 BA/acc/P/R/F1/AUC/Kappa 统计。"""
+    lstm_params = lstm_params or {}
     metric_names = ("ba", "acc", "precision", "recall", "f1", "auc", "kappa")
     repeat_scores: dict[str, list[float]] = {k: [] for k in metric_names}
     fold_details: list[dict] = []
@@ -223,7 +259,33 @@ def compute_kfold_classification(
             X_tr = X[tr_idx]
             X_te = X[te_idx]
 
-            y_pred, y_proba, classes = compute_rf(X_tr, X_te, y_tr, y_te)
+            if classifier == "lstm":
+                lstm_mode = str(lstm_params.get("mode", "flat150"))
+                common = dict(
+                    hidden_size=int(lstm_params.get("hidden_size", 64)),
+                    num_layers=int(lstm_params.get("num_layers", 2)),
+                    epochs=int(lstm_params.get("epochs", 100)),
+                    lr=float(lstm_params.get("lr", 0.001)),
+                    batch_size=int(lstm_params.get("batch_size", 64)),
+                    device=str(lstm_params.get("device", "cpu")),
+                    seed=int(lstm_params.get("seed", 1)),
+                )
+                if lstm_mode == "traj":
+                    y_pred, y_proba, classes = compute_traj_lstm(
+                        _sanitize_features(X_tr),
+                        _sanitize_features(X_te),
+                        y_tr, y_te,
+                        **common,
+                    )
+                else:
+                    y_pred, y_proba, classes = compute_lstm(
+                        _sanitize_features(X_tr),
+                        _sanitize_features(X_te),
+                        y_tr, y_te,
+                        **common,
+                    )
+            else:
+                y_pred, y_proba, classes = compute_rf(X_tr, X_te, y_tr, y_te)
             y_eval = y[te_idx]
             m = fold_classification_metrics(y_eval, y_pred, y_proba, classes)
 
@@ -278,6 +340,39 @@ def compute_kfold_classification(
     return out
 
 
+def feature_partial_stem(
+    feature: str, slice_name: str, tag: str, suffix: str,
+    classifier: str = "rf", level: int | None = None,
+) -> str:
+    """partial JSON 文件名（无 .json）。"""
+    prefix = "lstm_classify" if classifier == "lstm" else "legacy_classify"
+    if feature == "stats6":
+        return f"{slice_name}_{prefix}_eps{tag}_partial{suffix}"
+    if feature == "traj100":
+        return f"{slice_name}_{prefix}_traj100_eps{tag}_partial{suffix}"
+    if feature == "stats6_traj100":
+        return f"{slice_name}_{prefix}_stats6_traj100_eps{tag}_partial{suffix}"
+    if feature == "stats6_topo6":
+        return f"{slice_name}_{prefix}_stats6_topo6_eps{tag}_partial{suffix}"
+    if feature == "stats6_l10":
+        return f"{slice_name}_{prefix}_stats6_l10_eps{tag}_partial{suffix}"
+    if feature == "stats6_topo6_l10":
+        return f"{slice_name}_{prefix}_stats6_topo6_l10_eps{tag}_partial{suffix}"
+    if feature == "stats6_l10_pca30":
+        return f"{slice_name}_{prefix}_stats6_l10_pca30_eps{tag}_partial{suffix}"
+    if feature == "stats6_topo6_l10_pca30":
+        return f"{slice_name}_{prefix}_stats6_topo6_l10_pca30_eps{tag}_partial{suffix}"
+    if feature == "traj100_l10":
+        return f"{slice_name}_{prefix}_traj100_l10_eps{tag}_partial{suffix}"
+    if feature == "trajfull_l10":
+        return f"{slice_name}_{prefix}_trajfull_l10_eps{tag}_partial{suffix}"
+    if feature == "trajfull":
+        if level is None:
+            raise ValueError("trajfull partial 须指定 level")
+        return f"{slice_name}_{prefix}_trajfull_L{level:02d}_eps{tag}_partial{suffix}"
+    raise ValueError(f"未知特征: {feature}")
+
+
 def load_level_features(
     feature: str,
     sim_dir: Path,
@@ -285,14 +380,34 @@ def load_level_features(
     level: int,
     tag: str,
     sample_idx: np.ndarray | None = None,
+    topo_root: Path | None = None,
 ) -> np.ndarray:
     if feature == "stats6":
         return load_level_stats(sim_dir, slice_name, level, tag, recompute=False)
     if feature == "traj100":
         if sample_idx is None:
             raise ValueError("traj100 需要 sample_idx")
+        load_level_traj_features, _ = _traj100_helpers()
         X = load_level_traj_features(sim_dir, slice_name, level, tag, sample_idx)
         return sanitize_features(X, f"{slice_name} L{level:02d}")
+    if feature == "stats6_traj100":
+        if sample_idx is None:
+            raise ValueError("stats6_traj100 需要 sample_idx")
+        stats = load_level_stats(sim_dir, slice_name, level, tag, recompute=False)
+        load_level_traj_features, _ = _traj100_helpers()
+        traj = load_level_traj_features(sim_dir, slice_name, level, tag, sample_idx)
+        traj = sanitize_features(traj, f"{slice_name} L{level:02d} traj")
+        return np.hstack([stats, traj])
+    if feature == "stats6_topo6":
+        if topo_root is None:
+            raise ValueError("stats6_topo6 需要 topo_root")
+        stats = load_level_stats(sim_dir, slice_name, level, tag, recompute=False)
+        topo = load_level_topo(topo_root, slice_name, level)
+        if stats.shape[0] != topo.shape[0]:
+            raise ValueError(
+                f"{slice_name} L{level:02d}: stats {stats.shape[0]} != topo {topo.shape[0]}"
+            )
+        return np.hstack([stats, topo])
     raise ValueError(f"未知特征: {feature}")
 
 
@@ -302,8 +417,15 @@ def main() -> None:
     parser.add_argument("--slice", default="GSE84133human1")
     parser.add_argument("--level", type=int, default=None, help="指定层；默认跑 L01-L10")
     parser.add_argument(
-        "--feature", choices=("stats6", "traj100"), default="stats6",
-        help="stats6=6维统计量; traj100=轨迹每10步采样100点",
+        "--feature",
+        choices=(
+            "stats6", "traj100", "stats6_traj100", "stats6_topo6",
+            "stats6_l10", "stats6_topo6_l10", "stats6_l10_pca30",
+            "stats6_topo6_l10_pca30", "traj100_l10",
+            "trajfull_l10", "trajfull",
+        ),
+        default="stats6",
+        help="stats6=6维单层; stats6_topo6_l10=120维; stats6_l10_pca30=60+PCA; stats6_topo6_l10_pca30=120+PCA",
     )
     parser.add_argument(
         "--epsilon", type=float, default=None,
@@ -321,12 +443,35 @@ def main() -> None:
         help="与旧 GSE 脚本一致: np.random.seed(1) + set() 去重上采样",
     )
     parser.add_argument(
+        "--classifier",
+        choices=("rf", "lstm"),
+        default="rf",
+        help="分类器：rf=RandomForest; lstm=L01-L10序列LSTM+PCA30",
+    )
+    parser.add_argument("--lstm-hidden", type=int, default=64)
+    parser.add_argument("--lstm-layers", type=int, default=2)
+    parser.add_argument("--lstm-epochs", type=int, default=100)
+    parser.add_argument("--lstm-lr", type=float, default=0.001)
+    parser.add_argument("--lstm-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--lstm-device", default="auto",
+        help="LSTM 设备: auto|cuda|cpu（默认 auto=有 GPU 则用 cuda）",
+    )
+    parser.add_argument(
         "--partial-out", action="store_true",
         help="并行分片模式：单 ε 结果写入 partial JSON，供 aggregate 汇总",
     )
     parser.add_argument(
         "--file-suffix", type=str, default="",
         help="读取 stats/trj 文件名后缀，如 ns2000 → stats_40-0_ns2000.npy",
+    )
+    parser.add_argument(
+        "--experiment-tag", type=str, default=None,
+        help="结果写入 classify_dir/{slice}/{tag}/，避免覆盖主扫描",
+    )
+    parser.add_argument(
+        "--topo-root", type=str, default=None,
+        help="拓扑特征根目录（默认 paths.topo_features_dir/{slice}/）",
     )
     args = parser.parse_args()
 
@@ -337,21 +482,36 @@ def main() -> None:
     scrna_dir = Path(__file__).resolve().parent
     slice_name = args.slice
 
+    slice_result_dir = legacy_classify_dir(cfg, scrna_dir, slice_name)
+    if args.experiment_tag:
+        slice_result_dir = slice_result_dir / args.experiment_tag
     if args.out_dir:
         out_dir = Path(args.out_dir)
     else:
         sub = "partial" if args.partial_out else "scan"
-        out_dir = scrna_dir / slice_name / "legacy_classify" / sub
+        out_dir = slice_result_dir / sub
     out_dir.mkdir(parents=True, exist_ok=True)
 
     sim_dir = resolve_path(scrna_dir, cfg["paths"]["sim_dir"])
+    if args.feature in ("stats6_topo6", "stats6_topo6_l10", "stats6_topo6_l10_pca30"):
+        topo_root = (
+            Path(args.topo_root)
+            if args.topo_root
+            else topo_features_root(cfg, scrna_dir)
+        )
+    else:
+        topo_root = None
     aij_dir = resolve_path(scrna_dir, cfg["paths"]["output_dir"])
     label_dir = resolve_path(scrna_dir, cfg["paths"]["input_dir"])
     graph_mode = str(cfg.get("graph", {}).get("sim_mode", "pearson"))
     num_levels = int(cfg["graph"]["num_levels"])
     n_steps = int(cfg["dynamics"]["n_steps"])
     stride = 10
-    sample_idx = trajectory_sample_indices(n_steps, stride) if args.feature == "traj100" else None
+    if args.feature in ("traj100", "stats6_traj100", "traj100_l10"):
+        _, trajectory_sample_indices = _traj100_helpers()
+        sample_idx = trajectory_sample_indices(n_steps, stride)
+    else:
+        sample_idx = None
 
     if args.eps_list:
         eps_raw = args.eps_list.replace("#", ",")
@@ -367,11 +527,72 @@ def main() -> None:
 
     levels = [args.level] if args.level else list(range(1, num_levels + 1))
 
+    lstm_features = (
+        "stats6_topo6_l10_pca30", "traj100_l10", "trajfull_l10", "trajfull",
+    )
+    if args.classifier == "lstm" and args.feature not in lstm_features:
+        parser.error(f"LSTM 分类器当前仅支持 --feature {' / '.join(lstm_features)}")
+    if args.feature == "trajfull" and args.level is None:
+        parser.error("trajfull 须 --level 指定单层（L01-L10）")
+    if args.feature == "trajfull_l10" and args.level is not None:
+        parser.error("trajfull_l10 为 10 层混合特征，勿指定 --level")
+
     mode = "strict_legacy_set_dedup" if args.strict_legacy else "legacy_resample_no_dedup"
-    feat_label = "6维统计" if args.feature == "stats6" else f"轨迹100点(stride={stride})"
+    if args.classifier == "lstm":
+        mode = f"lstm_{mode}"
+    if args.feature == "trajfull_l10":
+        clf_label = "LSTM(L01-L10 trajfull)"
+    elif args.feature == "trajfull":
+        clf_label = f"LSTM(L{args.level:02d} trajfull)"
+    elif args.feature == "traj100_l10":
+        clf_label = "LSTM(L01-L10 traj100)"
+    elif args.classifier == "lstm":
+        clf_label = "LSTM(L01-L10 seq + PCA30)"
+    else:
+        clf_label = "RF + StandardScaler"
+    lstm_params = {
+        "hidden_size": args.lstm_hidden,
+        "num_layers": args.lstm_layers,
+        "epochs": args.lstm_epochs,
+        "lr": args.lstm_lr,
+        "batch_size": args.lstm_batch_size,
+        "device": resolve_lstm_device(args.lstm_device),
+        "seed": 1,
+        "mode": (
+            "traj" if args.feature in ("traj100_l10", "trajfull_l10", "trajfull")
+            else "flat150"
+        ),
+    }
+    cv_kwargs = dict(
+        n_splits=args.n_splits,
+        n_repeats=args.n_repeats,
+        strict_legacy=args.strict_legacy,
+        classifier=args.classifier,
+        lstm_params=lstm_params,
+    )
+    feat_labels = {
+        "stats6": "6维统计",
+        "traj100": f"轨迹100点(stride={stride})",
+        "stats6_traj100": f"stats6+traj100拼接106维(stride={stride})",
+        "stats6_topo6": "stats6+topo6拼接12维(同层动力学+拓扑)",
+        "stats6_l10": "L01-L10各层stats6拼接60维(无拓扑)",
+        "stats6_topo6_l10": "L01-L10各层stats6+topo6拼接120维",
+        "stats6_l10_pca30": "L01-L10 stats6(60维)+PCA坐标拼接",
+        "stats6_topo6_l10_pca30": "L01-L10 stats6+topo6(120维)+PCA坐标拼接",
+        "traj100_l10": "L01-L10 Burgers轨迹100点(10×100)",
+        "trajfull_l10": "L01-L10 Burgers完整保存轨迹(10×T)",
+    }
+    if args.feature == "trajfull":
+        feat_label = f"L{args.level:02d} Burgers完整保存轨迹(1×T)"
+    else:
+        feat_label = feat_labels[args.feature]
     print(f"=== 旧版训练流程: {slice_name} {feat_label} ({mode}) ===")
     print(f"ε 列表: {eps_values}")
-    print(f"CV: {args.n_splits}-fold × {args.n_repeats} repeats, RF + StandardScaler")
+    print(f"CV: {args.n_splits}-fold × {args.n_repeats} repeats, {clf_label}")
+    if args.classifier == "lstm":
+        print(f"LSTM device: {lstm_params['device']}, batch={lstm_params['batch_size']}, "
+              f"hidden={lstm_params['hidden_size']}, layers={lstm_params['num_layers']}, "
+              f"epochs={lstm_params['epochs']}, lr={lstm_params['lr']}")
     if args.strict_legacy:
         print("adjust_train_test: train>5, test>3, choice(5×avgCount) + set() 去重, seed=1\n")
     else:
@@ -382,19 +603,189 @@ def main() -> None:
         tag = eps_tag(eps)
         if args.file_suffix:
             tag = f"{tag}_{args.file_suffix}"
-        for lvl in levels:
-            data_name = f"stats_{tag}.npy" if args.feature == "stats6" else f"trj_{tag}.npy"
-            data_path = partial_level_dir(sim_dir, slice_name, lvl) / data_name
-            if not data_path.exists():
-                print(f"[SKIP] ε={eps:.1f} L{lvl:02d}: 无 {data_path.name}")
+        if args.feature == "stats6_topo6_l10":
+            if not all_levels_stats_topo_ready(
+                sim_dir, topo_root, slice_name, tag, num_levels,
+            ):
+                print(f"[SKIP] ε={eps:.1f}: 缺少 L01-L10 stats 或 topo")
                 continue
+            X = load_alllevels_stats6_topo6(
+                sim_dir, topo_root, slice_name, tag, num_levels=num_levels,
+            )
+            print(f"ε={eps:.1f} L01-L10: X{X.shape} ...", flush=True)
+            res = compute_kfold_classification(
+                X, y, **cv_kwargs,
+            )
+            res["epsilon"] = eps
+            res["level"] = 0
+            grid_results.append(res)
+            print(
+                f"  BA={res['balanced_accuracy_mean']:.4f}±{res['balanced_accuracy_std']:.4f}  "
+                f"acc={res['accuracy_mean']:.4f}±{res['accuracy_std']:.4f}  "
+                f"P={res['precision_mean']:.4f} R={res['recall_mean']:.4f} "
+                f"F1={res['f1_mean']:.4f} AUC={res['auc_mean']:.4f} κ={res['kappa_mean']:.4f}",
+                flush=True,
+            )
+            continue
+        if args.feature == "stats6_l10":
+            if not all_levels_stats_ready(sim_dir, slice_name, tag, num_levels):
+                print(f"[SKIP] ε={eps:.1f}: 缺少 L01-L10 stats")
+                continue
+            X = load_alllevels_stats6(
+                sim_dir, slice_name, tag, num_levels=num_levels,
+            )
+            print(f"ε={eps:.1f} L01-L10 stats6: X{X.shape} ...", flush=True)
+            res = compute_kfold_classification(
+                X, y, **cv_kwargs,
+            )
+            res["epsilon"] = eps
+            res["level"] = 0
+            grid_results.append(res)
+            print(
+                f"  BA={res['balanced_accuracy_mean']:.4f}±{res['balanced_accuracy_std']:.4f}  "
+                f"acc={res['accuracy_mean']:.4f}±{res['accuracy_std']:.4f}  "
+                f"P={res['precision_mean']:.4f} R={res['recall_mean']:.4f} "
+                f"F1={res['f1_mean']:.4f} AUC={res['auc_mean']:.4f} κ={res['kappa_mean']:.4f}",
+                flush=True,
+            )
+            continue
+        if args.feature == "traj100_l10":
+            if sample_idx is None:
+                raise RuntimeError("traj100_l10 需要 sample_idx")
+            if not all_levels_trj_ready(sim_dir, slice_name, tag, num_levels):
+                print(f"[SKIP] ε={eps:.1f}: 缺少 L01-L10 trj")
+                continue
+            X = load_alllevels_traj100(
+                sim_dir, slice_name, tag, sample_idx, num_levels=num_levels,
+            )
+            print(f"ε={eps:.1f} L01-L10 traj100: X{X.shape} ...", flush=True)
+            res = compute_kfold_classification(X, y, **cv_kwargs)
+            res["epsilon"] = eps
+            res["level"] = 0
+            grid_results.append(res)
+            print(
+                f"  BA={res['balanced_accuracy_mean']:.4f}±{res['balanced_accuracy_std']:.4f}  "
+                f"acc={res['accuracy_mean']:.4f}±{res['accuracy_std']:.4f}  "
+                f"P={res['precision_mean']:.4f} R={res['recall_mean']:.4f} "
+                f"F1={res['f1_mean']:.4f} AUC={res['auc_mean']:.4f} κ={res['kappa_mean']:.4f}",
+                flush=True,
+            )
+            continue
+        if args.feature == "trajfull_l10":
+            if not all_levels_trj_ready(sim_dir, slice_name, tag, num_levels):
+                print(f"[SKIP] ε={eps:.1f}: 缺少 L01-L10 trj")
+                continue
+            X = load_alllevels_traj_full(
+                sim_dir, slice_name, tag, num_levels=num_levels,
+            )
+            print(f"ε={eps:.1f} L01-L10 trajfull: X{X.shape} ...", flush=True)
+            res = compute_kfold_classification(X, y, **cv_kwargs)
+            res["epsilon"] = eps
+            res["level"] = 0
+            grid_results.append(res)
+            print(
+                f"  BA={res['balanced_accuracy_mean']:.4f}±{res['balanced_accuracy_std']:.4f}  "
+                f"acc={res['accuracy_mean']:.4f}±{res['accuracy_std']:.4f}  "
+                f"P={res['precision_mean']:.4f} R={res['recall_mean']:.4f} "
+                f"F1={res['f1_mean']:.4f} AUC={res['auc_mean']:.4f} κ={res['kappa_mean']:.4f}",
+                flush=True,
+            )
+            continue
+        if args.feature == "trajfull":
+            trj_path = partial_level_dir(sim_dir, slice_name, args.level) / f"trj_{tag}.npy"
+            if not trj_path.exists():
+                print(f"[SKIP] ε={eps:.1f} L{args.level:02d}: 无 {trj_path.name}")
+                continue
+            X = load_level_traj_full(
+                sim_dir, slice_name, args.level, tag,
+            )[:, np.newaxis, :]
+            print(f"ε={eps:.1f} L{args.level:02d} trajfull: X{X.shape} ...", flush=True)
+            res = compute_kfold_classification(X, y, **cv_kwargs)
+            res["epsilon"] = eps
+            res["level"] = args.level
+            grid_results.append(res)
+            print(
+                f"  BA={res['balanced_accuracy_mean']:.4f}±{res['balanced_accuracy_std']:.4f}  "
+                f"acc={res['accuracy_mean']:.4f}±{res['accuracy_std']:.4f}  "
+                f"P={res['precision_mean']:.4f} R={res['recall_mean']:.4f} "
+                f"F1={res['f1_mean']:.4f} AUC={res['auc_mean']:.4f} κ={res['kappa_mean']:.4f}",
+                flush=True,
+            )
+            continue
+        if args.feature == "stats6_topo6_l10_pca30":
+            if not all_levels_stats_topo_ready(
+                sim_dir, topo_root, slice_name, tag, num_levels,
+            ):
+                print(f"[SKIP] ε={eps:.1f}: 缺少 L01-L10 stats 或 topo")
+                continue
+            X = load_alllevels_stats6_topo6_pca30(
+                sim_dir, topo_root, aij_dir, slice_name, tag, num_levels=num_levels,
+            )
+            print(f"ε={eps:.1f} L01-L10 stats6+topo6+PCA: X{X.shape} ...", flush=True)
+            res = compute_kfold_classification(
+                X, y, **cv_kwargs,
+            )
+            res["epsilon"] = eps
+            res["level"] = 0
+            grid_results.append(res)
+            print(
+                f"  BA={res['balanced_accuracy_mean']:.4f}±{res['balanced_accuracy_std']:.4f}  "
+                f"acc={res['accuracy_mean']:.4f}±{res['accuracy_std']:.4f}  "
+                f"P={res['precision_mean']:.4f} R={res['recall_mean']:.4f} "
+                f"F1={res['f1_mean']:.4f} AUC={res['auc_mean']:.4f} κ={res['kappa_mean']:.4f}",
+                flush=True,
+            )
+            continue
+        if args.feature == "stats6_l10_pca30":
+            if not all_levels_stats_ready(sim_dir, slice_name, tag, num_levels):
+                print(f"[SKIP] ε={eps:.1f}: 缺少 L01-L10 stats")
+                continue
+            X = load_alllevels_stats6_pca30(
+                sim_dir, aij_dir, slice_name, tag, num_levels=num_levels,
+            )
+            print(f"ε={eps:.1f} L01-L10 stats6+PCA: X{X.shape} ...", flush=True)
+            res = compute_kfold_classification(
+                X, y, **cv_kwargs,
+            )
+            res["epsilon"] = eps
+            res["level"] = 0
+            grid_results.append(res)
+            print(
+                f"  BA={res['balanced_accuracy_mean']:.4f}±{res['balanced_accuracy_std']:.4f}  "
+                f"acc={res['accuracy_mean']:.4f}±{res['accuracy_std']:.4f}  "
+                f"P={res['precision_mean']:.4f} R={res['recall_mean']:.4f} "
+                f"F1={res['f1_mean']:.4f} AUC={res['auc_mean']:.4f} κ={res['kappa_mean']:.4f}",
+                flush=True,
+            )
+            continue
+        for lvl in levels:
+            if args.feature == "stats6_traj100":
+                stats_path = partial_level_dir(sim_dir, slice_name, lvl) / f"stats_{tag}.npy"
+                trj_path = partial_level_dir(sim_dir, slice_name, lvl) / f"trj_{tag}.npy"
+                if not stats_path.exists() or not trj_path.exists():
+                    missing = trj_path.name if not trj_path.exists() else stats_path.name
+                    print(f"[SKIP] ε={eps:.1f} L{lvl:02d}: 无 {missing}")
+                    continue
+            elif args.feature == "stats6_topo6":
+                stats_path = partial_level_dir(sim_dir, slice_name, lvl) / f"stats_{tag}.npy"
+                topo_path = topo_root / slice_name / f"{slice_name}_topo_L{lvl:02d}.npy"
+                if not stats_path.exists() or not topo_path.exists():
+                    missing = topo_path.name if not topo_path.exists() else stats_path.name
+                    print(f"[SKIP] ε={eps:.1f} L{lvl:02d}: 无 {missing}")
+                    continue
+            else:
+                data_name = f"stats_{tag}.npy" if args.feature == "stats6" else f"trj_{tag}.npy"
+                data_path = partial_level_dir(sim_dir, slice_name, lvl) / data_name
+                if not data_path.exists():
+                    print(f"[SKIP] ε={eps:.1f} L{lvl:02d}: 无 {data_path.name}")
+                    continue
             X = load_level_features(
-                args.feature, sim_dir, slice_name, lvl, tag, sample_idx=sample_idx,
+                args.feature, sim_dir, slice_name, lvl, tag,
+                sample_idx=sample_idx, topo_root=topo_root,
             )
             print(f"ε={eps:.1f} L{lvl:02d}: X{X.shape} ...", flush=True)
             res = compute_kfold_classification(
-                X, y, n_splits=args.n_splits, n_repeats=args.n_repeats,
-                strict_legacy=args.strict_legacy,
+                X, y, **cv_kwargs,
             )
             res["epsilon"] = eps
             res["level"] = lvl
@@ -418,6 +809,7 @@ def main() -> None:
     summary = {
         "slice": slice_name,
         "feature": args.feature,
+        "classifier": args.classifier,
         "method": mode,
         "strict_legacy": args.strict_legacy,
         "epsilon_values": eps_values,
@@ -434,34 +826,79 @@ def main() -> None:
         "best_kappa": best["kappa_mean"],
         "grid": grid_results,
     }
-    if args.feature == "traj100":
+    if args.feature in ("traj100", "stats6_traj100"):
         summary["trajectory_stride"] = stride
         summary["n_trajectory_points"] = int(sample_idx.size)
+    if args.feature == "stats6_traj100":
+        summary["n_feature_dims"] = 106
+    if args.feature == "stats6_topo6":
+        summary["n_feature_dims"] = 12
+        summary["topo_features_dir"] = str(topo_root)
+    if args.feature == "stats6_l10":
+        summary["n_feature_dims"] = 6 * num_levels
+        summary["level_mode"] = "L01-L10_stats6_concat"
+    if args.feature == "stats6_topo6_l10":
+        summary["n_feature_dims"] = 12 * num_levels
+        summary["level_mode"] = "L01-L10_concat"
+        summary["topo_features_dir"] = str(topo_root)
+    if args.feature == "stats6_l10_pca30":
+        pca_dim = int(load_pca_coords(aij_dir, slice_name).shape[1])
+        summary["n_feature_dims"] = 6 * num_levels + pca_dim
+        summary["level_mode"] = "L01-L10_stats6_plus_pca"
+        summary["pca_dims"] = pca_dim
+    if args.feature == "stats6_topo6_l10_pca30":
+        pca_dim = int(load_pca_coords(aij_dir, slice_name).shape[1])
+        summary["n_feature_dims"] = 12 * num_levels + pca_dim
+        summary["level_mode"] = "L01-L10_stats6_topo6_plus_pca"
+        summary["pca_dims"] = pca_dim
+        summary["topo_features_dir"] = str(topo_root)
+    if args.feature == "traj100_l10":
+        summary["n_feature_dims"] = num_levels * int(sample_idx.size)
+        summary["level_mode"] = "L01-L10_traj100"
+        summary["trajectory_stride"] = stride
+        summary["n_trajectory_points"] = int(sample_idx.size)
+    if args.feature == "trajfull_l10":
+        summary["level_mode"] = "L01-L10_trajfull"
+        summary["trajectory_mode"] = "saved_full_uniform"
+    if args.feature == "trajfull":
+        summary["level_mode"] = f"L{args.level:02d}_trajfull"
+        summary["trajectory_mode"] = "saved_full_uniform"
 
     suffix = "_strict_legacy" if args.strict_legacy else ""
     if args.partial_out and len(eps_values) == 1:
         tag = eps_tag(eps_values[0])
         if args.file_suffix:
             tag = f"{tag}_{args.file_suffix}"
-        out_stem = (
-            f"{slice_name}_legacy_classify_eps{tag}_partial{suffix}"
-            if args.feature == "stats6"
-            else f"{slice_name}_legacy_classify_traj100_eps{tag}_partial{suffix}"
+        stem_level = args.level if args.feature == "trajfull" else None
+        out_stem = feature_partial_stem(
+            args.feature, slice_name, tag, suffix,
+            classifier=args.classifier, level=stem_level,
         )
     else:
         scan_tag = "_eps_scan" if len(eps_values) > 1 or args.eps_list else ""
-        out_stem = (
-            f"{slice_name}_legacy_classify_stats6{scan_tag}{suffix}"
-            if args.feature == "stats6"
-            else f"{slice_name}_legacy_classify_traj100{scan_tag}{suffix}"
-        )
+        exp_tag = f"_{args.experiment_tag}" if args.experiment_tag else ""
+        feat_scan = {
+            "stats6": "stats6",
+            "traj100": "traj100",
+            "stats6_traj100": "stats6_traj100",
+            "stats6_topo6": "stats6_topo6",
+            "stats6_l10": "stats6_l10",
+            "stats6_topo6_l10": "stats6_topo6_l10",
+            "stats6_l10_pca30": "stats6_l10_pca30",
+            "stats6_topo6_l10_pca30": "stats6_topo6_l10_pca30",
+            "traj100_l10": "traj100_l10",
+            "trajfull_l10": "trajfull_l10",
+            "trajfull": "trajfull",
+        }[args.feature]
+        cls_prefix = "lstm_classify" if args.classifier == "lstm" else "legacy_classify"
+        out_stem = f"{slice_name}_{cls_prefix}_{feat_scan}{scan_tag}{exp_tag}{suffix}"
     out_path = out_dir / f"{out_stem}.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
 
     # 完整扫描时写出 all_score/ + result.json（partial 单片由 aggregate 汇总后再写）
     if not (args.partial_out and len(eps_values) == 1):
-        legacy_dir = scrna_dir / slice_name / "legacy_classify"
+        legacy_dir = slice_result_dir
         export_meta = {
             "feature": args.feature,
             "method": mode,
